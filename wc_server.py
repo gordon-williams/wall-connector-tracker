@@ -27,25 +27,27 @@ from flask import Flask, Response, jsonify, request
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-# Defaults — override via config.json or CLI args
-WC_IP             = ""      # required: set in config.json ("wc_ip") or --wc-ip
-POLL_S            = 30
-DB_PATH           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wc_sessions.db")
-CONFIG_PATH       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# Fixed at startup — changing these requires a restart
+WC_IP       = ""
+POLL_S      = 30
+DB_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wc_sessions.db")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-RATE_GENERAL      = 0.30    # $/kWh general/peak — set in config.json ("rate_general_kwh")
-RATE_EV_POWERUP   = 0.08    # $/kWh EV off-peak plan rate ("rate_ev_powerup_kwh")
-OFFPEAK_START_H   = 22      # off-peak window start hour local time ("offpeak_start_hour")
-OFFPEAK_END_H     = 7       # off-peak window end hour local time   ("offpeak_end_hour")
+AUTO_TAG_AFTER_S = 120   # seconds of data before auto-tagging vehicle
 
-# Vehicle auto-detection by average charge power (W)
-# Below threshold → vehicles[1], above → vehicles[0]
-POWER_THRESHOLD_W = 8750    # configurable: "vehicle_power_threshold_w"
-AUTO_TAG_AFTER_S  = 120     # wait N seconds before auto-tagging
-
-# Vehicle names [high-power, low-power] — configurable: "vehicles": ["Tesla", "Shark"]
-VEHICLE_HIGH      = "Tesla"
-VEHICLE_LOW       = "Shark"
+# Live-editable config — updated by PATCH /api/config, persisted to config.json
+CONFIG: dict = {
+    "rate_general_kwh":    0.30,
+    "rate_ev_powerup_kwh": 0.08,
+    "offpeak_start_hour":  22,
+    "offpeak_end_hour":    7,
+    "vehicles": [
+        {"name": "Tesla",   "max_power_w": 13000, "ev_powerup": True},
+        {"name": "Shark",   "max_power_w":  7000, "ev_powerup": False},
+        {"name": "Unknown", "max_power_w":  9999, "ev_powerup": False},
+    ],
+}
+CONFIG_LOCK = Lock()
 
 app = Flask(__name__)
 
@@ -138,17 +140,33 @@ def fetch_json(url):
         return None
 
 
-def is_offpeak(dt_local: datetime) -> bool:
-    h = dt_local.hour
-    return h >= OFFPEAK_START_H or h < OFFPEAK_END_H
+def save_config():
+    full = {"wc_ip": WC_IP, **CONFIG}
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(full, f, indent=4)
 
 
-def tesla_rate(start_time_iso: str) -> float:
-    try:
-        dt = datetime.fromisoformat(start_time_iso).astimezone()
-        return RATE_EV_POWERUP if is_offpeak(dt) else RATE_GENERAL
-    except Exception:
-        return RATE_GENERAL
+def detect_vehicle(avg_power_w: float) -> str:
+    """Match observed average power to the lowest-capacity vehicle that can explain it."""
+    vs = sorted(CONFIG["vehicles"], key=lambda v: v.get("max_power_w", 0))
+    for v in vs:
+        if avg_power_w <= v.get("max_power_w", 0) * 1.2:
+            return v["name"]
+    return vs[-1]["name"] if vs else "Unknown"
+
+
+def rate_for_vehicle(vehicle_name: str, start_iso: str) -> float:
+    for v in CONFIG["vehicles"]:
+        if v["name"] == vehicle_name and v.get("ev_powerup", False):
+            try:
+                dt = datetime.fromisoformat(start_iso).astimezone()
+                h  = dt.hour
+                s, e = CONFIG["offpeak_start_hour"], CONFIG["offpeak_end_hour"]
+                if h >= s or h < e:
+                    return CONFIG["rate_ev_powerup_kwh"]
+            except Exception:
+                pass
+    return CONFIG["rate_general_kwh"]
 
 
 def fmt_duration(s):
@@ -161,7 +179,7 @@ def fmt_duration(s):
 
 def session_cost(row: dict) -> float:
     wh   = row.get("energy_wh") or 0
-    rate = row.get("rate_kwh") or RATE_GENERAL
+    rate = row.get("rate_kwh") or CONFIG["rate_general_kwh"]
     return round(wh / 1000 * rate, 4)
 
 
@@ -233,16 +251,15 @@ def poller():
                 # Auto-tag vehicle once we have 2+ minutes of data
                 if not poller_state["auto_tagged"] and duration >= AUTO_TAG_AFTER_S and poller_state["session_energy"] > 0:
                     avg_w   = poller_state["session_energy"] / (duration / 3600)
-                    vehicle = VEHICLE_HIGH if avg_w > POWER_THRESHOLD_W else VEHICLE_LOW
+                    vehicle = detect_vehicle(avg_w)
                     start   = db_one("SELECT start_time FROM sessions WHERE id=?", (session_id,))
-                    rate    = tesla_rate(start["start_time"]) if vehicle == "Tesla" else RATE_GENERAL
+                    rate    = rate_for_vehicle(vehicle, start["start_time"])
                     db_exec(
                         "UPDATE sessions SET vehicle=?, auto_tagged=1, rate_kwh=? WHERE id=?",
                         (vehicle, rate, session_id)
                     )
                     poller_state["auto_tagged"] = True
-                    rate_str = f"${rate:.4f}/kWh"
-                    print(f"[{now_utc.strftime('%H:%M:%S')}] Session {session_id} → {vehicle}  {avg_w:.0f}W  {rate_str}")
+                    print(f"[{now_utc.strftime('%H:%M:%S')}] Session {session_id} → {vehicle}  {avg_w:.0f}W  ${rate:.4f}/kWh")
 
             # ── Session ended ──────────────────────────────────────────────
             elif not is_charging and was_charging and session_id:
@@ -363,10 +380,7 @@ def api_session_patch(sid):
         params.append(vehicle)
         updates.append("auto_tagged=0")
         # Recalculate rate when vehicle changes
-        if vehicle == VEHICLE_HIGH:
-            rate = tesla_rate(row["start_time"])
-        else:
-            rate = RATE_GENERAL
+        rate = rate_for_vehicle(vehicle, row["start_time"])
         updates.append("rate_kwh=?")
         params.append(rate)
 
@@ -409,18 +423,23 @@ def api_session_samples(sid):
     return jsonify(rows)
 
 
-@app.route("/api/config")
-def api_config():
-    return jsonify({
-        "wc_ip":                WC_IP,
-        "rate_general_kwh":     RATE_GENERAL,
-        "rate_ev_powerup_kwh":  RATE_EV_POWERUP,
-        "offpeak_start_hour":   OFFPEAK_START_H,
-        "offpeak_end_hour":     OFFPEAK_END_H,
-        "vehicle_high":         VEHICLE_HIGH,
-        "vehicle_low":          VEHICLE_LOW,
-        "vehicle_power_threshold_w": POWER_THRESHOLD_W,
-    })
+@app.route("/api/config", methods=["GET"])
+def api_config_get():
+    return jsonify({"wc_ip": WC_IP, **CONFIG})
+
+
+@app.route("/api/config", methods=["PATCH"])
+def api_config_patch():
+    body = request.get_json(force=True)
+    with CONFIG_LOCK:
+        for key in ("rate_general_kwh", "rate_ev_powerup_kwh",
+                    "offpeak_start_hour", "offpeak_end_hour"):
+            if key in body:
+                CONFIG[key] = body[key]
+        if "vehicles" in body:
+            CONFIG["vehicles"] = body["vehicles"]
+        save_config()
+    return jsonify({"ok": True, **CONFIG})
 
 
 @app.route("/api/lifetime")
@@ -497,6 +516,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .sum-label{font-size:11px;color:#555;margin-bottom:4px}
   .sum-val{font-size:16px;font-weight:600;color:#fff}
   .offpeak-note{font-size:11px;color:#555;margin-top:6px;text-align:center}
+  .live-section{background:#111;border:1px solid #1e3a1e;border-radius:8px;padding:16px 20px;margin-bottom:20px;display:none}
+  .live-header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .live-title{font-size:12px;font-weight:600;color:#00c853}
+  .live-sub{font-size:11px;color:#555}
+  .live-chart-wrap{height:200px;position:relative}
   .trend-btn{background:none;border:1px solid #2a2a2a;color:#555;padding:2px 7px;border-radius:3px;cursor:pointer;font-size:11px}
   .trend-btn:hover{border-color:#444;color:#aaa}
   #chart-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:100;align-items:center;justify-content:center}
@@ -512,7 +536,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <body>
 <header>
   <h1><span class="dot green" id="conn-dot"></span>Wall Connector</h1>
-  <span id="poll-ts">–</span>
+  <div style="display:flex;gap:16px;align-items:center">
+    <span id="poll-ts" style="font-size:11px;color:#555">–</span>
+    <a href="/settings" style="font-size:12px;color:#555;text-decoration:none">Settings</a>
+  </div>
 </header>
 
 <div class="container">
@@ -528,17 +555,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="stat"><div class="stat-label">Firmware</div><div class="stat-value dim" id="s-firmware">–</div></div>
   </div>
 
+  <!-- Live charge section -->
+  <div class="live-section" id="live-section">
+    <div class="live-header">
+      <span class="dot green"></span>
+      <span class="live-title" id="live-title">Charging now</span>
+      <span class="live-sub" id="live-sub"></span>
+      <div style="flex:1"></div>
+      <button class="btn" id="live-btn-energy" onclick="switchLiveAxis('energy')">vs Energy</button>
+      <button class="btn" id="live-btn-time"   onclick="switchLiveAxis('time')">vs Time</button>
+    </div>
+    <div class="live-chart-wrap"><canvas id="live-chart"></canvas></div>
+  </div>
+
   <!-- Toolbar -->
   <div class="toolbar">
     <button class="btn active" onclick="setDays(7)">7 days</button>
     <button class="btn" onclick="setDays(30)">30 days</button>
     <button class="btn" onclick="setDays(90)">90 days</button>
     <button class="btn" onclick="setDays(null)">All</button>
-    <select class="filter" onchange="setVehicle(this.value)">
+    <select class="filter" id="vehicle-filter" onchange="setVehicle(this.value)">
       <option value="">All vehicles</option>
-      <option value="Tesla">Tesla</option>
-      <option value="Shark">Shark</option>
-      <option value="Unknown">Unknown</option>
     </select>
     <div class="spacer"></div>
     <span style="font-size:11px;color:#444" id="session-count">–</span>
@@ -571,8 +608,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-let currentDays = 7;
+let currentDays    = 7;
 let currentVehicle = '';
+let vehicleNames   = ['Unknown'];
+let liveSessionId  = null;
+let liveAxis       = 'energy';
+let liveChart      = null;
 
 function setDays(d) {
   currentDays = d;
@@ -614,8 +655,21 @@ async function loadStatus() {
 
     if (cs) {
       document.getElementById('s-cost').textContent = '$' + cs.cost.toFixed(2);
+      // Drive live section
+      const liveEl = document.getElementById('live-section');
+      liveEl.style.display = 'block';
+      document.getElementById('live-title').textContent =
+        `Session #${cs.id} — ${cs.vehicle || 'detecting…'}`;
+      document.getElementById('live-sub').textContent =
+        `${cs.energy_wh ? (cs.energy_wh/1000).toFixed(2)+' kWh' : '–'}`;
+      if (cs.id !== liveSessionId) {
+        liveSessionId = cs.id;
+        if (liveChart) { liveChart.destroy(); liveChart = null; }
+      }
+      loadLiveSamples(cs.id);
     } else {
       document.getElementById('s-cost').textContent = '–';
+      document.getElementById('live-section').style.display = 'none';
     }
 
     const wifi = d.wifi || {};
@@ -679,9 +733,8 @@ async function loadSessions() {
       <td>${timeStr}</td>
       <td>
         <select class="vehicle-select ${vClass}" onchange="patchSession(${row.id}, 'vehicle', this.value, this)">
-          <option ${vehicle==='Tesla'  ? 'selected' : ''}>Tesla</option>
-          <option ${vehicle==='Shark'  ? 'selected' : ''}>Shark</option>
-          <option ${vehicle==='Unknown'? 'selected' : ''}>Unknown</option>
+          ${vehicleNames.map(n => `<option ${vehicle===n?'selected':''}>${n}</option>`).join('')}
+          ${vehicleNames.includes(vehicle) ? '' : `<option selected>${vehicle}</option>`}
         </select>
         ${row.auto_tagged ? '<span class="auto-tag">~</span>' : ''}
       </td>
@@ -772,6 +825,79 @@ async function patchSession(id, field, value, selectEl) {
 function fmtDur(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h}h ${String(m).padStart(2,'0')}m` : `${m}m`;
+}
+
+// ── Live chart ────────────────────────────────────────────────────────────────
+async function loadLiveSamples(sid) {
+  try {
+    const r       = await fetch(`/api/sessions/${sid}/samples`);
+    const samples = await r.json();
+    renderLiveChart(samples);
+  } catch(e) {}
+}
+
+function switchLiveAxis(axis) {
+  liveAxis = axis;
+  document.getElementById('live-btn-energy').classList.toggle('active', axis === 'energy');
+  document.getElementById('live-btn-time').classList.toggle('active', axis === 'time');
+}
+
+function renderLiveChart(samples) {
+  const pts = samples.filter(s => s.power_w !== null && s.power_w > 0);
+  if (!pts.length) return;
+
+  const base = samples[0];
+  let labels, xLabel;
+  if (liveAxis === 'energy') {
+    labels = pts.map(s => ((s.energy_wh - (base.energy_wh||0)) / 1000).toFixed(2));
+    xLabel = 'Energy delivered (kWh)';
+  } else {
+    const t0 = new Date(base.ts);
+    labels = pts.map(s => ((new Date(s.ts) - t0) / 60000).toFixed(1));
+    xLabel = 'Time (min)';
+  }
+
+  const ctx = document.getElementById('live-chart').getContext('2d');
+  if (liveChart) {
+    liveChart.data.labels = labels;
+    liveChart.data.datasets[0].data = pts.map(s => s.power_w);
+    liveChart.options.scales.x.title.text = xLabel;
+    liveChart.update('none');
+    return;
+  }
+  liveChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        data: pts.map(s => s.power_w),
+        borderColor: '#00c853',
+        backgroundColor: 'rgba(0,200,83,0.06)',
+        borderWidth: 2,
+        tension: 0.35,
+        pointRadius: 2,
+        pointHoverRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1a1a1a', borderColor: '#333', borderWidth: 1,
+          titleColor: '#ccc', bodyColor: '#ccc',
+          callbacks: { label: ctx => `${(ctx.parsed.y/1000).toFixed(2)} kW` }
+        }
+      },
+      scales: {
+        x: { title: { display: true, text: xLabel, color: '#555', font: {size:11} },
+             ticks: { color: '#555', maxTicksLimit: 8 }, grid: { color: '#1a1a1a' } },
+        y: { title: { display: true, text: 'Power (W)', color: '#555', font: {size:11} },
+             ticks: { color: '#555', callback: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v },
+             grid: { color: '#1a1a1a' }, min: 0 }
+      }
+    }
+  });
 }
 
 // ── Trend chart ───────────────────────────────────────────────────────────────
@@ -893,14 +1019,27 @@ async function loadConfig() {
   try {
     const r = await fetch('/api/config');
     const c = await r.json();
+
+    // Populate vehicle names for dropdowns
+    vehicleNames = (c.vehicles || []).map(v => v.name);
+    if (!vehicleNames.includes('Unknown')) vehicleNames.push('Unknown');
+
+    const filter = document.getElementById('vehicle-filter');
+    const prev   = filter.value;
+    filter.innerHTML = '<option value="">All vehicles</option>' +
+      vehicleNames.map(n => `<option value="${n}">${n}</option>`).join('');
+    filter.value = prev;
+
+    // Footer note
     const note = document.getElementById('rate-note');
-    if (note) {
+    if (note && c.vehicles) {
       const s = c.offpeak_start_hour, e = c.offpeak_end_hour;
       const fmtH = h => h === 0 ? '12am' : h < 12 ? `${h}am` : h === 12 ? '12pm' : `${h-12}pm`;
+      const evVehicles = c.vehicles.filter(v => v.ev_powerup).map(v => v.name).join(', ');
       note.textContent =
-        `~ = auto-tagged by power (threshold ${(c.vehicle_power_threshold_w/1000).toFixed(2)} kW)  •  ` +
-        `${c.vehicle_high} off-peak (${fmtH(s)}–${fmtH(e)}) rate: $${c.rate_ev_powerup_kwh.toFixed(3)}/kWh  •  ` +
-        `General rate: $${c.rate_general_kwh.toFixed(4)}/kWh`;
+        `~ = auto-tagged  •  ` +
+        (evVehicles ? `${evVehicles} off-peak (${fmtH(s)}–${fmtH(e)}): $${c.rate_ev_powerup_kwh.toFixed(3)}/kWh  •  ` : '') +
+        `General: $${c.rate_general_kwh.toFixed(4)}/kWh`;
     }
   } catch(e) {}
 }
@@ -931,6 +1070,180 @@ setInterval(loadSessions, 60000);
 </html>"""
 
 
+SETTINGS_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wall Connector — Settings</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0d0d0d;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}
+  header{padding:14px 24px;border-bottom:1px solid #1e1e1e;display:flex;align-items:center;gap:16px}
+  a.back{color:#555;text-decoration:none;font-size:13px}a.back:hover{color:#ccc}
+  h1{font-size:15px;font-weight:600;color:#fff}
+  .container{max-width:700px;margin:0 auto;padding:24px}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:#555;margin:28px 0 12px}
+  .card{background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:16px 20px}
+  .field{display:grid;grid-template-columns:220px 1fr;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid #161616}
+  .field:last-child{border-bottom:none}
+  .field label{font-size:12px;color:#888}
+  input[type=text],input[type=number]{background:#1a1a1a;border:1px solid #2a2a2a;color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:13px;width:100%}
+  input:focus{outline:none;border-color:#444}
+  .vehicle-row{display:grid;grid-template-columns:1fr 110px 90px 32px;gap:8px;align-items:center;margin-bottom:8px}
+  .vehicle-row .col-label{font-size:11px;color:#555;padding-bottom:4px}
+  .check-wrap{display:flex;align-items:center;gap:6px;font-size:12px;color:#888}
+  input[type=checkbox]{accent-color:#00c853;width:15px;height:15px;cursor:pointer}
+  .del-btn{background:#1a1a1a;border:1px solid #2a2a2a;color:#666;width:28px;height:28px;border-radius:4px;cursor:pointer;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center}
+  .del-btn:hover{border-color:#c00;color:#f44}
+  .add-btn{background:#1a1a1a;border:1px solid #2a2a2a;color:#888;padding:6px 14px;border-radius:4px;cursor:pointer;font-size:12px;margin-top:8px}
+  .add-btn:hover{border-color:#444;color:#ccc}
+  .save-btn{background:#1a3a5c;border:1px solid #1e5a9c;color:#64b5f6;padding:8px 24px;border-radius:5px;cursor:pointer;font-size:13px;font-weight:600;margin-top:20px}
+  .save-btn:hover{background:#1e4a7c}
+  .status{font-size:12px;color:#00c853;margin-top:8px;min-height:18px}
+  .note{font-size:11px;color:#444;margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <a class="back" href="/">← Dashboard</a>
+  <h1>Settings</h1>
+</header>
+<div class="container">
+
+  <h2>Vehicles</h2>
+  <p class="note" style="margin-bottom:12px">
+    Vehicle is auto-detected by average charge power after 2 minutes.
+    The lowest-capacity vehicle whose max power × 1.2 ≥ observed power is chosen.
+  </p>
+  <div class="card">
+    <div class="vehicle-row" style="margin-bottom:2px">
+      <span class="col-label">Name</span>
+      <span class="col-label">Max power (W)</span>
+      <span class="col-label">EV off-peak rate</span>
+      <span></span>
+    </div>
+    <div id="vehicles-list"></div>
+    <button class="add-btn" onclick="addVehicle()">+ Add vehicle</button>
+  </div>
+
+  <h2>Electricity Rates</h2>
+  <div class="card">
+    <div class="field">
+      <label>General rate ($/kWh)</label>
+      <input type="number" id="rate_general" step="0.0001" min="0">
+    </div>
+    <div class="field">
+      <label>EV off-peak rate ($/kWh)</label>
+      <input type="number" id="rate_ev_powerup" step="0.0001" min="0">
+    </div>
+  </div>
+
+  <h2>Off-peak Window (local time)</h2>
+  <div class="card">
+    <div class="field">
+      <label>Start hour (0–23)</label>
+      <input type="number" id="offpeak_start" min="0" max="23">
+    </div>
+    <div class="field">
+      <label>End hour (0–23)</label>
+      <input type="number" id="offpeak_end" min="0" max="23">
+    </div>
+  </div>
+  <p class="note">e.g. Start 22, End 7 = 10pm to 7am. Applied to vehicles with EV off-peak rate enabled.</p>
+
+  <button class="save-btn" onclick="saveConfig()">Save</button>
+  <div class="status" id="status"></div>
+
+  <h2>Charger</h2>
+  <div class="card">
+    <div class="field">
+      <label>Wall Connector IP</label>
+      <input type="text" id="wc_ip" disabled style="color:#555">
+    </div>
+  </div>
+  <p class="note">IP address requires a server restart to change (edit config.json).</p>
+</div>
+
+<script>
+let cfg = {};
+
+async function load() {
+  const r = await fetch('/api/config');
+  cfg = await r.json();
+  document.getElementById('rate_general').value   = cfg.rate_general_kwh    || 0;
+  document.getElementById('rate_ev_powerup').value = cfg.rate_ev_powerup_kwh || 0;
+  document.getElementById('offpeak_start').value  = cfg.offpeak_start_hour  ?? 22;
+  document.getElementById('offpeak_end').value    = cfg.offpeak_end_hour    ?? 7;
+  document.getElementById('wc_ip').value          = cfg.wc_ip || '';
+  renderVehicles(cfg.vehicles || []);
+}
+
+function renderVehicles(vehicles) {
+  const list = document.getElementById('vehicles-list');
+  list.innerHTML = '';
+  vehicles.forEach((v, i) => {
+    const row = document.createElement('div');
+    row.className = 'vehicle-row';
+    row.dataset.i = i;
+    row.innerHTML = `
+      <input type="text" value="${v.name || ''}" oninput="updateV(${i},'name',this.value)" placeholder="Vehicle name">
+      <input type="number" value="${v.max_power_w || ''}" oninput="updateV(${i},'max_power_w',+this.value)" placeholder="Watts" min="0">
+      <div class="check-wrap">
+        <input type="checkbox" ${v.ev_powerup ? 'checked' : ''} onchange="updateV(${i},'ev_powerup',this.checked)">
+        off-peak
+      </div>
+      <button class="del-btn" onclick="removeV(${i})">×</button>`;
+    list.appendChild(row);
+  });
+}
+
+function updateV(i, key, val) {
+  cfg.vehicles[i][key] = val;
+}
+function removeV(i) {
+  cfg.vehicles.splice(i, 1);
+  renderVehicles(cfg.vehicles);
+}
+function addVehicle() {
+  if (!cfg.vehicles) cfg.vehicles = [];
+  cfg.vehicles.push({name: '', max_power_w: 0, ev_powerup: false});
+  renderVehicles(cfg.vehicles);
+}
+
+async function saveConfig() {
+  const payload = {
+    rate_general_kwh:    +document.getElementById('rate_general').value,
+    rate_ev_powerup_kwh: +document.getElementById('rate_ev_powerup').value,
+    offpeak_start_hour:  +document.getElementById('offpeak_start').value,
+    offpeak_end_hour:    +document.getElementById('offpeak_end').value,
+    vehicles:            cfg.vehicles,
+  };
+  const r = await fetch('/api/config', {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  const st = document.getElementById('status');
+  if (r.ok) {
+    st.textContent = 'Saved.';
+    setTimeout(() => st.textContent = '', 3000);
+  } else {
+    st.textContent = 'Error saving.';
+    st.style.color = '#f44';
+  }
+}
+
+load();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/settings")
+def settings():
+    return Response(SETTINGS_HTML, mimetype="text/html")
+
+
 @app.route("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
@@ -955,20 +1268,24 @@ def main():
               f"Copy config.example.json → config.json and set wc_ip.")
         sys.exit(1)
 
-    global WC_IP, RATE_GENERAL, RATE_EV_POWERUP, OFFPEAK_START_H, OFFPEAK_END_H
-    global POWER_THRESHOLD_W, VEHICLE_HIGH, VEHICLE_LOW
-    WC_IP             = args.wc_ip or cfg.get("wc_ip", "")
-    RATE_GENERAL      = cfg.get("rate_general_kwh",      RATE_GENERAL)
-    RATE_EV_POWERUP   = cfg.get("rate_ev_powerup_kwh",   RATE_EV_POWERUP)
-    OFFPEAK_START_H   = cfg.get("offpeak_start_hour",    OFFPEAK_START_H)
-    OFFPEAK_END_H     = cfg.get("offpeak_end_hour",      OFFPEAK_END_H)
-    POWER_THRESHOLD_W = cfg.get("vehicle_power_threshold_w", POWER_THRESHOLD_W)
-    vehicles          = cfg.get("vehicles", [VEHICLE_HIGH, VEHICLE_LOW])
-    VEHICLE_HIGH, VEHICLE_LOW = vehicles[0], vehicles[1]
-
+    global WC_IP
+    WC_IP = args.wc_ip or cfg.get("wc_ip", "")
     if not WC_IP:
         print("ERROR: wc_ip not set. Add it to config.json or use --wc-ip.")
         sys.exit(1)
+
+    # Populate live CONFIG from file (handle old vehicles: ["A","B"] format)
+    raw_vehicles = cfg.get("vehicles", CONFIG["vehicles"])
+    if raw_vehicles and isinstance(raw_vehicles[0], str):
+        raw_vehicles = [{"name": n, "max_power_w": 9999, "ev_powerup": False}
+                        for n in raw_vehicles]
+    CONFIG.update({
+        "rate_general_kwh":    cfg.get("rate_general_kwh",    CONFIG["rate_general_kwh"]),
+        "rate_ev_powerup_kwh": cfg.get("rate_ev_powerup_kwh", CONFIG["rate_ev_powerup_kwh"]),
+        "offpeak_start_hour":  cfg.get("offpeak_start_hour",  CONFIG["offpeak_start_hour"]),
+        "offpeak_end_hour":    cfg.get("offpeak_end_hour",    CONFIG["offpeak_end_hour"]),
+        "vehicles":            raw_vehicles,
+    })
 
     init_db()
 

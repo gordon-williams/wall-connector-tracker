@@ -7,7 +7,9 @@
     "offpeak_start_hour": 22,
     "offpeak_end_hour": 7,
 
-    "vehicle_power_threshold_w": 8750,
-
-    "vehicles": ["Tesla", "Other"]
+    "vehicles": [
+        {"name": "My EV",        "max_power_w": 3700,  "ev_powerup": false},
+        {"name": "Second EV",    "max_power_w": 7500,  "ev_powerup": false},
+        {"name": "Tesla",        "max_power_w": 13000, "ev_powerup": true}
+    ]
 }
