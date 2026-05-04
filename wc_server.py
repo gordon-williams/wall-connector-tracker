@@ -87,6 +87,16 @@ def init_db():
             notes       TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_samples (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  INTEGER NOT NULL,
+            ts          TEXT NOT NULL,
+            energy_wh   REAL,
+            current_a   REAL,
+            grid_v      REAL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -214,6 +224,10 @@ def poller():
                 db_exec(
                     "UPDATE sessions SET end_time=?, duration_s=?, energy_wh=? WHERE id=?",
                     (now_iso, duration, poller_state["session_energy"], session_id)
+                )
+                db_exec(
+                    "INSERT INTO session_samples (session_id, ts, energy_wh, current_a, grid_v) VALUES (?,?,?,?,?)",
+                    (session_id, now_iso, energy_wh, v.get("vehicle_current_a"), v.get("grid_v"))
                 )
 
                 # Auto-tag vehicle once we have 2+ minutes of data
@@ -373,6 +387,28 @@ def api_session_patch(sid):
     return jsonify(row)
 
 
+@app.route("/api/sessions/<int:sid>/samples")
+def api_session_samples(sid):
+    rows = db_query(
+        "SELECT ts, energy_wh, current_a, grid_v FROM session_samples WHERE session_id=? ORDER BY ts",
+        (sid,)
+    )
+    # Compute instantaneous power from consecutive energy readings
+    for i in range(len(rows)):
+        if i == 0:
+            rows[i]["power_w"] = None
+            continue
+        prev = rows[i - 1]
+        try:
+            dt = (datetime.fromisoformat(rows[i]["ts"]) -
+                  datetime.fromisoformat(prev["ts"])).total_seconds()
+            de = (rows[i]["energy_wh"] or 0) - (prev["energy_wh"] or 0)
+            rows[i]["power_w"] = round(de / (dt / 3600)) if dt > 0 and de >= 0 else None
+        except Exception:
+            rows[i]["power_w"] = None
+    return jsonify(rows)
+
+
 @app.route("/api/config")
 def api_config():
     return jsonify({
@@ -411,6 +447,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wall Connector</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#0d0d0d;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}
@@ -460,6 +497,16 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .sum-label{font-size:11px;color:#555;margin-bottom:4px}
   .sum-val{font-size:16px;font-weight:600;color:#fff}
   .offpeak-note{font-size:11px;color:#555;margin-top:6px;text-align:center}
+  .trend-btn{background:none;border:1px solid #2a2a2a;color:#555;padding:2px 7px;border-radius:3px;cursor:pointer;font-size:11px}
+  .trend-btn:hover{border-color:#444;color:#aaa}
+  #chart-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:100;align-items:center;justify-content:center}
+  .modal-box{background:#111;border:1px solid #222;border-radius:10px;padding:24px;width:min(820px,92vw);position:relative}
+  .modal-close{position:absolute;top:12px;right:16px;background:none;border:none;color:#666;font-size:18px;cursor:pointer;line-height:1}
+  .modal-close:hover{color:#ccc}
+  .modal-title{color:#fff;font-size:13px;font-weight:600;margin-bottom:4px}
+  .modal-sub{font-size:11px;color:#555;margin-bottom:16px}
+  .chart-wrap{height:300px;position:relative}
+  .modal-toggle{display:flex;gap:6px;margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -511,6 +558,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <th class="num">Rate</th>
         <th class="num">Cost</th>
         <th>Notes</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="sessions-tbody"></tbody>
@@ -646,7 +694,8 @@ async function loadSessions() {
         <input class="note-input" value="${(row.notes||'').replace(/"/g,'&quot;')}"
           onblur="patchSession(${row.id}, 'notes', this.value, null)"
           onkeydown="if(event.key==='Enter')this.blur()">
-      </td>`;
+      </td>
+      <td><button class="trend-btn" onclick="showChart(${row.id}, '${vehicle}', ${wh/1000})">Trend</button></td>`;
     tbody.appendChild(tr);
   }
 
@@ -725,6 +774,121 @@ function fmtDur(s) {
   return h ? `${h}h ${String(m).padStart(2,'0')}m` : `${m}m`;
 }
 
+// ── Trend chart ───────────────────────────────────────────────────────────────
+let chartInstance = null;
+let chartSamples  = [];
+let chartAxis     = 'energy';
+let chartMeta     = {};
+
+async function showChart(sessionId, vehicle, totalKwh) {
+  const r = await fetch(`/api/sessions/${sessionId}/samples`);
+  chartSamples = await r.json();
+
+  chartMeta = { sessionId, vehicle, totalKwh };
+  document.getElementById('chart-modal').style.display = 'flex';
+  document.getElementById('chart-title').textContent =
+    `Session #${sessionId} — ${vehicle} — ${totalKwh.toFixed(2)} kWh`;
+
+  chartAxis = 'energy';
+  document.getElementById('btn-energy').classList.add('active');
+  document.getElementById('btn-time').classList.remove('active');
+  renderChart();
+}
+
+function switchAxis(axis) {
+  chartAxis = axis;
+  document.getElementById('btn-energy').classList.toggle('active', axis === 'energy');
+  document.getElementById('btn-time').classList.toggle('active', axis === 'time');
+  renderChart();
+}
+
+function renderChart() {
+  const samples = chartSamples.filter(s => s.power_w !== null && s.power_w > 0);
+  if (!samples.length) {
+    document.getElementById('chart-sub').textContent = 'No sample data for this session.';
+    if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+    return;
+  }
+
+  // X-axis: energy delivered (kWh) or elapsed time (min)
+  let labels, xLabel;
+  if (chartAxis === 'energy') {
+    // Offset from session start energy
+    const baseEnergy = chartSamples[0].energy_wh || 0;
+    labels = samples.map(s => ((s.energy_wh - baseEnergy) / 1000).toFixed(2));
+    xLabel = 'Energy Delivered (kWh) — SOC proxy';
+  } else {
+    const t0 = new Date(chartSamples[0].ts);
+    labels = samples.map(s => ((new Date(s.ts) - t0) / 60000).toFixed(1));
+    xLabel = 'Time (minutes)';
+  }
+
+  const powers = samples.map(s => s.power_w);
+  const maxP   = Math.max(...powers);
+  document.getElementById('chart-sub').textContent =
+    `${samples.length} samples · peak ${(maxP/1000).toFixed(1)} kW`;
+
+  const ctx = document.getElementById('trend-chart').getContext('2d');
+  if (chartInstance) chartInstance.destroy();
+  chartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Power (W)',
+        data: powers,
+        borderColor: '#00c853',
+        backgroundColor: 'rgba(0,200,83,0.08)',
+        borderWidth: 2,
+        tension: 0.35,
+        pointRadius: 2,
+        pointHoverRadius: 5,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1a1a1a',
+          borderColor: '#333',
+          borderWidth: 1,
+          titleColor: '#ccc',
+          bodyColor: '#ccc',
+          callbacks: {
+            label: ctx => `${(ctx.parsed.y/1000).toFixed(2)} kW`
+          }
+        }
+      },
+      scales: {
+        x: {
+          title: { display: true, text: xLabel, color: '#555', font: { size: 11 } },
+          ticks: { color: '#555', maxTicksLimit: 10 },
+          grid:  { color: '#1a1a1a' }
+        },
+        y: {
+          title: { display: true, text: 'Power (W)', color: '#555', font: { size: 11 } },
+          ticks: { color: '#555', callback: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v },
+          grid:  { color: '#1a1a1a' },
+          min:   0
+        }
+      }
+    }
+  });
+}
+
+function closeChart() {
+  document.getElementById('chart-modal').style.display = 'none';
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+}
+
+// Close modal on backdrop click
+document.getElementById('chart-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('chart-modal')) closeChart();
+});
+
 async function loadConfig() {
   try {
     const r = await fetch('/api/config');
@@ -748,6 +912,21 @@ loadSessions();
 setInterval(loadStatus, 30000);
 setInterval(loadSessions, 60000);
 </script>
+<div id="chart-modal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeChart()">✕</button>
+    <div class="modal-title" id="chart-title"></div>
+    <div class="modal-sub" id="chart-sub"></div>
+    <div class="modal-toggle">
+      <button class="btn active" id="btn-energy" onclick="switchAxis('energy')">Power vs Energy</button>
+      <button class="btn" id="btn-time" onclick="switchAxis('time')">Power vs Time</button>
+    </div>
+    <div class="chart-wrap"><canvas id="trend-chart"></canvas></div>
+    <p style="font-size:11px;color:#333;margin-top:10px;text-align:center">
+      Calculated from 30-second energy samples · X-axis approximates SOC progression
+    </p>
+  </div>
+</div>
 </body>
 </html>"""
 
