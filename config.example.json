@@ -1,0 +1,13 @@
+{
+    "wc_ip": "192.168.1.100",
+
+    "rate_general_kwh": 0.30,
+    "rate_ev_powerup_kwh": 0.08,
+
+    "offpeak_start_hour": 22,
+    "offpeak_end_hour": 7,
+
+    "vehicle_power_threshold_w": 8750,
+
+    "vehicles": ["Tesla", "Other"]
+}

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Copy to ~/Library/LaunchAgents/com.yourname.wallconnector.plist and edit paths -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.yourname.wallconnector</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/python3</string>
+    <string>/path/to/WallConnector/wc_server.py</string>
+    <string>--port</string>
+    <string>8090</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/yourname/Library/Logs/wallconnector.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/yourname/Library/Logs/wallconnector.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/path/to/WallConnector</string>
+</dict>
+</plist>

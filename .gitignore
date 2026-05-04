@@ -1,0 +1,5 @@
+config.json
+wc_sessions.db
+__pycache__/
+*.pyc
+*.log
