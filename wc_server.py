@@ -12,6 +12,7 @@ API:        http://localhost:8090/api/status
 """
 
 import argparse
+import base64
 import json
 import os
 import signal
@@ -266,7 +267,15 @@ def api_status():
         sess_nrg  = poller_state["session_energy"]
         sess_st   = poller_state["session_start"]
 
-    lt = fetch_json(f"http://{WC_IP}/api/1/lifetime")
+    lt   = fetch_json(f"http://{WC_IP}/api/1/lifetime")
+    ver  = fetch_json(f"http://{WC_IP}/api/1/version")
+    wifi = fetch_json(f"http://{WC_IP}/api/1/wifi_status")
+
+    if wifi and wifi.get("wifi_ssid"):
+        try:
+            wifi["wifi_ssid_decoded"] = base64.b64decode(wifi["wifi_ssid"]).decode("utf-8")
+        except Exception:
+            wifi["wifi_ssid_decoded"] = wifi["wifi_ssid"]
 
     current_session = None
     if sess_id:
@@ -279,6 +288,8 @@ def api_status():
         "last_poll":       poll_ts,
         "vitals":          vitals,
         "lifetime":        lt,
+        "version":         ver,
+        "wifi":            wifi,
         "current_session": current_session,
     })
 
@@ -466,6 +477,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="stat"><div class="stat-label">Session duration</div><div class="stat-value" id="s-dur">–</div></div>
     <div class="stat"><div class="stat-label">Avg power</div><div class="stat-value" id="s-power">–</div></div>
     <div class="stat"><div class="stat-label">Est. cost</div><div class="stat-value" id="s-cost">–</div></div>
+    <div class="stat"><div class="stat-label">WiFi</div><div class="stat-value dim" id="s-wifi">–</div></div>
+    <div class="stat"><div class="stat-label">Firmware</div><div class="stat-value dim" id="s-firmware">–</div></div>
   </div>
 
   <!-- Toolbar -->
@@ -555,6 +568,25 @@ async function loadStatus() {
       document.getElementById('s-cost').textContent = '$' + cs.cost.toFixed(2);
     } else {
       document.getElementById('s-cost').textContent = '–';
+    }
+
+    const wifi = d.wifi || {};
+    const wifiEl = document.getElementById('s-wifi');
+    if (wifi.wifi_connected) {
+      const rssi = wifi.wifi_rssi || 0;
+      const strength = rssi >= -50 ? 'Excellent' : rssi >= -65 ? 'Good' : rssi >= -75 ? 'Fair' : 'Weak';
+      const inet = wifi.internet ? '' : ' · No internet';
+      wifiEl.textContent = `${strength} (${rssi} dBm)${inet}`;
+      wifiEl.title = wifi.wifi_ssid_decoded || '';
+    } else {
+      wifiEl.textContent = 'Disconnected';
+    }
+
+    const ver = d.version || {};
+    const fwEl = document.getElementById('s-firmware');
+    if (ver.firmware_version) {
+      fwEl.textContent = ver.firmware_version.split('+')[0];
+      fwEl.title = ver.firmware_version;
     }
   } catch(e) {
     document.getElementById('conn-dot').className = 'dot red';
