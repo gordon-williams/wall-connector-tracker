@@ -75,6 +75,8 @@ poller_state = {
 def make_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")   # reduce SD card wear on Pi
+    conn.execute("PRAGMA synchronous=NORMAL") # safe with WAL; faster than FULL
     return conn
 
 

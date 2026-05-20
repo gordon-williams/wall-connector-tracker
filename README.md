@@ -182,6 +182,7 @@ After 2 minutes of charge data the server computes an average power and picks th
 - `config.json` and `wc_sessions.db` are gitignored; they contain personal data
 - The charger only exposes the *current* session; all historical data is accumulated by this server's continuous polling — don't stop the server between charges
 - The Wall Connector API (`/api/1/vitals`) is undocumented and may change in future firmware
+- **SD card wear (Raspberry Pi):** the server writes a SQLite sample every 30 seconds. The database is opened in WAL mode (`PRAGMA journal_mode=WAL`) which batches writes and significantly reduces wear, but if you're running on a Pi Zero 2 W or Pi 4 with a cheap SD card, consider using a quality endurance-rated card (Samsung or SanDisk Endurance series) or booting from a USB drive
 
 ## License
 
