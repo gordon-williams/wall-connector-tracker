@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Gordon Williams — https://github.com/gordon-williams/wall-connector-tracker
 """Wall Connector CLI client — talks to wc_server.py over HTTP.
 
 Usage:
