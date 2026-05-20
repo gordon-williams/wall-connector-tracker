@@ -57,6 +57,19 @@ WC_SERVER=http://192.168.1.10:8090 python3 wc_client.py status
 pip install -r requirements.txt
 ```
 
+## Recommended hardware
+
+The server must run continuously — if it stops between charges, those sessions are lost. A dedicated low-power machine left on 24/7 is the right choice.
+
+| Hardware | Notes |
+|---|---|
+| **Raspberry Pi 4 / 5** | Best option. Plenty of headroom, active community, ~3–5 W idle. |
+| **Raspberry Pi Zero 2 W** | Cheapest option (~$15). Handles the polling load easily; slower to set up. |
+| **Old laptop / NUC / mini PC** | Works fine if it's already on 24/7. |
+| **macOS machine (always-on)** | Use the launchd setup (section 4b below). Sleep must be disabled or the server will miss sessions. |
+
+A Pi 4 or Zero 2 W on your home network is the recommended setup. The server uses negligible resources — SQLite writes every 30 seconds, one Flask thread, no GPU or heavy computation.
+
 ## Setup
 
 ### 1. Find your Wall Connector's IP address
