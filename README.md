@@ -25,6 +25,8 @@ Runs on a **Raspberry Pi** (systemd) or any always-on machine (macOS launchd). T
 ### Multi-vehicle support
 Any number of vehicles, each with a configurable name, maximum charge power, battery capacity, and flag for the off-peak EV rate. The server picks the closest match by power level.
 
+Vehicles can be added, edited, or removed live from the **Settings page** (`/config`) — no need to edit `config.json` by hand or restart the server.
+
 ### REST API
 | Endpoint | Description |
 |---|---|
@@ -171,6 +173,8 @@ The Tesla Wall Connector's `session_energy_wh` counter is cumulative and does **
 ## How vehicle auto-detection works
 
 After 2 minutes of charge data the server computes an average power and picks the first vehicle in `vehicles[]` whose `max_power_w` is ≥ that average. You can override any session's vehicle via the dashboard dropdown or the CLI `tag` command; the correct rate is applied automatically.
+
+> **Limitation:** if two vehicles charge at the same power level (e.g. two EVs on single-phase 7 kW), auto-detection cannot tell them apart and will always tag the lower-threshold entry. Workaround: limit one vehicle's charge rate in its app settings to create a detectable power gap, or correct the tag manually after each session.
 
 ## Notes
 
