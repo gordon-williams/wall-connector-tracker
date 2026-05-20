@@ -182,3 +182,11 @@ After 2 minutes of charge data the server computes an average power and picks th
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Acknowledgements
+
+- [Flask](https://flask.palletsprojects.com/) — BSD 3-Clause (Pallets)
+- [Chart.js](https://www.chartjs.org/) — MIT (Chart.js Contributors)
+- [html2canvas](https://html2canvas.hertzen.com/) — MIT (Niklas von Hertzen)
+
+Full license texts in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
