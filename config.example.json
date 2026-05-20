@@ -4,12 +4,13 @@
     "rate_general_kwh": 0.30,
     "rate_ev_powerup_kwh": 0.08,
 
-    "offpeak_start_hour": 22,
-    "offpeak_end_hour": 7,
+    "offpeak_start_hour": 21,
+    "offpeak_end_hour":   7,
 
     "vehicles": [
-        {"name": "My EV",        "max_power_w": 3700,  "ev_powerup": false},
-        {"name": "Second EV",    "max_power_w": 7500,  "ev_powerup": false},
-        {"name": "Tesla",        "max_power_w": 13000, "ev_powerup": true}
+        {"name": "My EV",     "max_power_w": 7400,  "capacity_kwh": 60.0,  "ev_powerup": true},
+        {"name": "Family EV", "max_power_w": 13000, "capacity_kwh": 82.0,  "ev_powerup": true},
+        {"name": "PHEV",      "max_power_w": 3700,  "capacity_kwh": 26.5,  "ev_powerup": false},
+        {"name": "Unknown",   "max_power_w": 9999,  "capacity_kwh": 0,     "ev_powerup": false}
     ]
 }
