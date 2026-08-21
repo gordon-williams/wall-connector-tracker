@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 *.log
 com.*.plist
+config.cloud.json
+wc_sessions.db-wal
+wc_sessions.db-shm
+.DS_Store
