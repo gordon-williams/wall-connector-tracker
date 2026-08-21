@@ -1,6 +1,9 @@
 {
     "wc_ip": "192.168.1.100",
 
+    "//db_path": "Keep this OUT of Dropbox/iCloud/OneDrive — see README.",
+    "db_path": "~/Library/Application Support/WallConnector/wc_sessions.db",
+
     "rate_general_kwh": 0.30,
     "rate_ev_powerup_kwh": 0.08,
 
@@ -12,5 +15,22 @@
         {"name": "Family EV", "max_power_w": 13000, "capacity_kwh": 82.0,  "ev_powerup": true},
         {"name": "PHEV",      "max_power_w": 3700,  "capacity_kwh": 26.5,  "ev_powerup": false},
         {"name": "Unknown",   "max_power_w": 9999,  "capacity_kwh": 0,     "ev_powerup": false}
-    ]
+    ],
+
+    "//offline_export": "Self-contained HTML snapshot written to a synced folder.",
+    "offline_export": {
+        "enabled": false,
+        "path":    "~/Dropbox/Charging/charge-history.html"
+    },
+
+    "//sync": "Optional: push history to a private internet mirror (cloud mode).",
+    "sync": {
+        "enabled":          false,
+        "url":              "https://charge.example.com",
+        "token":            "paste the output of: python3 wc_server.py --gen-token",
+        "interval_s":       300,
+        "sample_batch":     5000,
+        "completed_only":   true,
+        "idle_heartbeat_s": 86400
+    }
 }

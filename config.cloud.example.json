@@ -1,0 +1,9 @@
+{
+    "mode": "cloud",
+
+    "cloud": {
+        "sync_token":    "the same token as the home server's sync.token",
+        "password_hash": "output of: python3 wc_server.py --hash-password",
+        "require_https": true
+    }
+}

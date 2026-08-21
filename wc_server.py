@@ -3,9 +3,23 @@
 # Copyright (c) 2026 Gordon Williams — https://github.com/gordon-williams/wall-connector-tracker
 """Wall Connector Server — polls charger, stores sessions, serves web dashboard + REST API.
 
+Runs in one of two modes:
+
+  local (default)  Polls the Wall Connector over the LAN, stores sessions in
+                   SQLite, serves the full dashboard. Optionally pushes the
+                   history to a cloud mirror (the "sync" block in config.json).
+
+  cloud            No poller and no Wall Connector dependency. Ingests history
+                   pushed by the home server and serves the same dashboard
+                   read-only behind a password. Meant to run on a private
+                   internet host behind an HTTPS reverse proxy.
+
 Usage:
-    python3 wc_server.py              # start on port 8090
-    python3 wc_server.py --port 8090
+    python3 wc_server.py                           # local mode, port 8090
+    python3 wc_server.py --mode cloud --port 8090  # internet mirror
+    python3 wc_server.py --gen-token               # make a shared sync token
+    python3 wc_server.py --hash-password           # make a mirror password hash
+    python3 wc_server.py --resync                  # force a full re-push
 
 Dashboard: http://localhost:8090/
 API:        http://localhost:8090/api/status
@@ -15,17 +29,24 @@ API:        http://localhost:8090/api/status
 
 import argparse
 import base64
+import getpass
+import gzip
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import signal
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread
 
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, redirect, request
+from flask import session as login_session
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -36,6 +57,44 @@ DB_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wc_sessi
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 AUTO_TAG_AFTER_S = 120   # seconds of data before auto-tagging vehicle
+
+# "local" = poll the charger and serve; "cloud" = ingest pushes and serve read-only
+MODE = "local"
+
+# Local mode — push history to a private internet mirror ("sync" block in config.json)
+SYNC: dict = {
+    "enabled":      False,
+    "url":          "",     # e.g. https://charge.example.com
+    "token":        "",     # shared secret; must match the mirror's cloud.sync_token
+    "interval_s":   300,
+    "sample_batch": 5000,   # max sample rows per push
+    # When nothing has changed there is nothing to send. Push anyway this often
+    # so the mirror can show it is still being fed. Raising this matters on
+    # metered hosts, where every request wakes a sleeping database.
+    "idle_heartbeat_s": 86400,   # 24 hours; 0 disables the heartbeat entirely
+    # Only send sessions that have finished. Nothing goes out while a car is
+    # charging; the whole session and its samples are pushed in one go when it
+    # ends. The mirror becomes a pure history archive with no live view, which
+    # is what you want on a metered host — one wake-up per session instead of
+    # one every polling cycle. Set false for a near-live mirror.
+    "completed_only": True,
+}
+
+# Standalone HTML export ("offline_export" block in config.json) — writes a
+# single self-contained file with the whole history baked in, for reading from
+# a synced folder (Dropbox, iCloud) with no server involved.
+EXPORT: dict = {
+    "enabled": False,
+    "path":    "",   # e.g. ~/Dropbox/Charging/charge-history.html
+}
+
+# Cloud mode — the mirror's own credentials ("cloud" block in config.json)
+CLOUD: dict = {
+    "sync_token":    "",    # must match the home server's sync.token
+    "password_hash": "",    # pbkdf2_sha256$iters$salt$hash — see --hash-password
+    "secret_key":    "",    # signs the login cookie; generated on first run
+    "require_https": True,  # set false only when testing the mirror over plain http
+}
 
 # Live-editable config — updated by PATCH /api/config, persisted to config.json
 CONFIG: dict = {
@@ -72,6 +131,27 @@ poller_state = {
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
+CLOUD_SYNC_DIRS = ("/Dropbox/", "/Google Drive/", "/OneDrive/",
+                   "/Library/Mobile Documents/")   # iCloud Drive
+
+
+def warn_if_cloud_synced(path: str):
+    """SQLite in a file-syncing folder is a documented corruption path.
+
+    The sync client can upload the database and its -wal sidecar at different
+    moments, or copy one mid-write; on restore the two disagree and committed
+    transactions are lost. See https://www.sqlite.org/howtocorrupt.html
+    """
+    for marker in CLOUD_SYNC_DIRS:
+        if marker in path:
+            service = marker.strip("/").split("/")[0]
+            print(f"WARNING: the database is inside {service} ({path}).")
+            print("         File-syncing services can corrupt an open SQLite database.")
+            print("         Move it with:  python3 wc_server.py --migrate-db <new-path>")
+            return True
+    return False
+
+
 def make_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -105,6 +185,14 @@ def init_db():
             grid_v      REAL
         )
     """)
+    # Small key/value store: sync watermarks (local) and the mirrored
+    # config/status snapshots (cloud)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     # Add start_soc column to existing DBs that predate this field
     try:
         conn.execute("ALTER TABLE sessions ADD COLUMN start_soc REAL")
@@ -123,6 +211,57 @@ def init_db():
         pass  # column already exists
     conn.commit()
     conn.close()
+
+
+def migrate_db(dest: str) -> int:
+    """Copy the database to `dest` and point config.json at it.
+
+    Uses SQLite's backup API rather than a file copy, so the result is a
+    consistent snapshot even if the poller is mid-write and even in WAL mode.
+    The original is left untouched.
+    """
+    dest = os.path.abspath(os.path.expanduser(dest))
+    if os.path.isdir(dest):
+        dest = os.path.join(dest, "wc_sessions.db")
+    if os.path.exists(dest):
+        print(f"ERROR: {dest} already exists — refusing to overwrite.")
+        return 1
+    if not os.path.exists(DB_PATH):
+        print(f"ERROR: no database at {DB_PATH}.")
+        return 1
+
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(dest)
+    with dst:
+        src.backup(dst)
+
+    def counts(conn):
+        return tuple(conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                     for t in ("sessions", "session_samples"))
+    before, after = counts(src), counts(dst)
+    check = dst.execute("PRAGMA integrity_check").fetchone()[0]
+    src.close()
+    dst.close()
+
+    if before != after or check != "ok":
+        print(f"ERROR: verification failed (source {before}, copy {after}, integrity '{check}').")
+        print(f"       The copy at {dest} was NOT adopted; the original is untouched.")
+        return 1
+
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    cfg["db_path"] = dest
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=4)
+
+    print(f"Copied {before[0]} sessions and {before[1]} samples to:\n  {dest}")
+    print(f"Verified: integrity_check ok, row counts match.")
+    print(f"config.json now points at the new location.")
+    print(f"\nRestart the server, confirm it works, then delete the old file:\n  {DB_PATH}")
+    return 0
 
 
 def recalc_session_durations():
@@ -172,6 +311,28 @@ def db_one(sql, params=()):
     return dict(row) if row else None
 
 
+def db_exec_many(sql, rows):
+    """Batch write in one transaction — used by the cloud sync ingest."""
+    rows = list(rows)
+    if not rows:
+        return 0
+    with _db_lock:
+        conn = make_conn()
+        conn.executemany(sql, rows)
+        conn.commit()
+        conn.close()
+    return len(rows)
+
+
+def meta_get(key, default=None):
+    row = db_one("SELECT value FROM meta WHERE key=?", (key,))
+    return row["value"] if row else default
+
+
+def meta_set(key, value):
+    db_exec("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)", (key, str(value)))
+
+
 # ── API helpers ───────────────────────────────────────────────────────────────
 
 def fetch_json(url):
@@ -183,7 +344,15 @@ def fetch_json(url):
 
 
 def save_config():
-    full = {"wc_ip": WC_IP, **CONFIG}
+    """Persist live CONFIG, preserving keys we don't manage (sync, cloud, mode)."""
+    full = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                full = json.load(f)
+        except Exception:
+            full = {}
+    full.update({"wc_ip": WC_IP, **CONFIG})
     with open(CONFIG_PATH, "w") as f:
         json.dump(full, f, indent=4)
 
@@ -397,16 +566,28 @@ def poller():
                                     session_energy_baseline=0.0,
                                     session_start=None, auto_tagged=False,
                                     charge_duration_s=0)
+                poller_state["export_pending"] = True
 
             poller_state["was_charging"] = is_charging
+
+        # Regenerating the file touches every session, so do it once the lock is
+        # released rather than blocking /api/status behind it.
+        with state_lock:
+            pending = poller_state.pop("export_pending", False)
+        if pending:
+            maybe_export_offline()
 
         time.sleep(POLL_S)
 
 
 # ── REST API ──────────────────────────────────────────────────────────────────
 
-@app.route("/api/status")
-def api_status():
+def build_status() -> dict:
+    """Live vitals + current session, read straight from the charger (local mode).
+
+    This is also the snapshot pushed to the mirror, so the mirrored dashboard can
+    show the last known state without any access to the Wall Connector.
+    """
     with state_lock:
         vitals    = poller_state["last_vitals"]
         poll_err  = poller_state["poll_error"]
@@ -431,7 +612,7 @@ def api_status():
         if row:
             current_session = {**row, "cost": session_cost(row)}
 
-    return jsonify({
+    return {
         "ok":              not poll_err,
         "last_poll":       poll_ts,
         "vitals":          vitals,
@@ -439,7 +620,24 @@ def api_status():
         "version":         ver,
         "wifi":            wifi,
         "current_session": current_session,
-    })
+    }
+
+
+@app.route("/api/status")
+def api_status():
+    if MODE == "cloud":
+        snap = meta_get("synced_status")
+        try:
+            data = json.loads(snap) if snap else {}
+        except Exception:
+            data = {}
+        data.setdefault("ok", False)
+        data.setdefault("vitals", None)
+        data.setdefault("current_session", None)
+        data["mirror"]    = True
+        data["synced_at"] = meta_get("last_sync_at")
+        return jsonify(data)
+    return jsonify(build_status())
 
 
 @app.route("/api/sessions")
@@ -483,6 +681,8 @@ def api_session_get(sid):
 
 @app.route("/api/sessions/<int:sid>", methods=["PATCH"])
 def api_session_patch(sid):
+    if MODE == "cloud":
+        return jsonify({"error": "read-only mirror — edit on the home server"}), 403
     row = db_one("SELECT * FROM sessions WHERE id=?", (sid,))
     if not row:
         return jsonify({"error": "not found"}), 404
@@ -523,11 +723,12 @@ def api_session_patch(sid):
 
     row = db_one("SELECT * FROM sessions WHERE id=?", (sid,))
     row["cost"] = session_cost(row)
+    if updates:
+        maybe_export_offline()
     return jsonify(row)
 
 
-@app.route("/api/sessions/<int:sid>/samples")
-def api_session_samples(sid):
+def session_samples_with_power(sid):
     rows = db_query(
         "SELECT ts, energy_wh, current_a, grid_v FROM session_samples WHERE session_id=? ORDER BY ts",
         (sid,)
@@ -545,16 +746,29 @@ def api_session_samples(sid):
             rows[i]["power_w"] = round(de / (dt / 3600)) if dt > 0 and de >= 0 else None
         except Exception:
             rows[i]["power_w"] = None
-    return jsonify(rows)
+    return rows
+
+
+@app.route("/api/sessions/<int:sid>/samples")
+def api_session_samples(sid):
+    return jsonify(session_samples_with_power(sid))
 
 
 @app.route("/api/config", methods=["GET"])
 def api_config_get():
+    if MODE == "cloud":
+        saved = meta_get("synced_config")
+        try:
+            return jsonify({**CONFIG, **(json.loads(saved) if saved else {})})
+        except Exception:
+            return jsonify({**CONFIG})
     return jsonify({"wc_ip": WC_IP, **CONFIG})
 
 
 @app.route("/api/config", methods=["PATCH"])
 def api_config_patch():
+    if MODE == "cloud":
+        return jsonify({"error": "read-only mirror — edit on the home server"}), 403
     body = request.get_json(force=True)
     with CONFIG_LOCK:
         for key in ("rate_general_kwh", "rate_ev_powerup_kwh",
@@ -567,8 +781,7 @@ def api_config_patch():
     return jsonify({"ok": True, **CONFIG})
 
 
-@app.route("/api/sessions/recent-per-vehicle")
-def api_recent_per_vehicle():
+def recent_per_vehicle_rows():
     rows = db_query("""
         SELECT s.* FROM sessions s
         INNER JOIN (
@@ -584,11 +797,23 @@ def api_recent_per_vehicle():
         d = dict(r)
         d["cost"] = session_cost(r)
         result.append(d)
-    return jsonify(result)
+    return result
+
+
+@app.route("/api/sessions/recent-per-vehicle")
+def api_recent_per_vehicle():
+    return jsonify(recent_per_vehicle_rows())
 
 
 @app.route("/api/lifetime")
 def api_lifetime():
+    if MODE == "cloud":
+        snap = meta_get("synced_status")
+        try:
+            lt = (json.loads(snap) if snap else {}).get("lifetime")
+        except Exception:
+            lt = None
+        return jsonify(lt or {"error": "no data synced yet"})
     lt = fetch_json(f"http://{WC_IP}/api/1/lifetime")
     return jsonify(lt or {"error": "unreachable"})
 
@@ -603,6 +828,468 @@ def api_summary():
     return jsonify({"by_vehicle": rows, "totals": totals})
 
 
+# ── Sync between the home server and the internet mirror ──────────────────────
+#
+# The Wall Connector's API is LAN-only, so the poller has to stay at home. The
+# mirror therefore never talks to the charger: the home server pushes rows to it
+# over HTTPS with a shared bearer token, and the mirror serves them read-only.
+# Nothing inbound is ever opened on the home network.
+
+SESSION_COLUMNS = ("id", "start_time", "end_time", "duration_s", "energy_wh",
+                   "vehicle", "auto_tagged", "rate_kwh", "notes",
+                   "start_soc", "end_soc", "energy_wh_baseline")
+SAMPLE_COLUMNS  = ("id", "session_id", "ts", "energy_wh", "current_a", "grid_v")
+
+SYNCED_CONFIG_KEYS = ("rate_general_kwh", "rate_ev_powerup_kwh",
+                      "offpeak_start_hour", "offpeak_end_hour", "vehicles")
+
+
+def sessions_fingerprint(rows) -> str:
+    """Content hash of the sessions table — a cheap way to spot any edit.
+
+    Only ever compared against itself: the mirror stores whatever fingerprint
+    came with the rows it accepted and echoes that back, rather than
+    recomputing one. That keeps the protocol portable to a mirror written in
+    another language, where reproducing this hash byte for byte would be
+    unreasonable.
+    """
+    return hashlib.sha256(
+        json.dumps(rows, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def read_sessions_for_sync(completed_only=False):
+    sql = "SELECT " + ", ".join(SESSION_COLUMNS) + " FROM sessions"
+    if completed_only:
+        sql += " WHERE end_time IS NOT NULL"
+    return db_query(sql + " ORDER BY id")
+
+
+# ── Push side (local mode) ────────────────────────────────────────────────────
+
+def post_sync(payload: dict) -> dict:
+    """POST a gzipped payload to the mirror. Raises on transport/HTTP failure."""
+    body = gzip.compress(json.dumps(payload, default=str).encode())
+    req  = urllib.request.Request(
+        SYNC["url"].rstrip("/") + "/api/sync",
+        data=body,
+        headers={
+            "Content-Type":     "application/json",
+            "Content-Encoding": "gzip",
+            "Authorization":    "Bearer " + SYNC["token"],
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def sync_once() -> dict:
+    """Push edited sessions and new samples to the mirror.
+
+    Sessions are small (one row per plug event) so the whole table goes out
+    whenever its fingerprint changes — that catches edits to any historical row.
+    Samples are the bulk of the data and go out incrementally by row id.
+    """
+    completed_only = bool(SYNC.get("completed_only", True))
+
+    sessions    = read_sessions_for_sync(completed_only)
+    fingerprint = sessions_fingerprint(sessions)
+    send_sessions = fingerprint != meta_get("sync_sessions_hash")
+
+    last_sample = int(meta_get("sync_last_sample_id", 0) or 0)
+    batch       = max(1, int(SYNC.get("sample_batch") or 5000))
+    # Samples belonging to an in-progress session, or orphaned by a deleted
+    # session row, are filtered out here. The watermark only ever advances to
+    # the last row actually sent, so held-back samples go out later; orphans
+    # are simply skipped, which is what we want — nothing references them.
+    smp_sql = ("SELECT " + ", ".join(SAMPLE_COLUMNS) + " FROM session_samples "
+               "WHERE id > ?")
+    if completed_only:
+        smp_sql += " AND session_id IN (SELECT id FROM sessions WHERE end_time IS NOT NULL)"
+    samples = db_query(smp_sql + " ORDER BY id LIMIT ?", (last_sample, batch))
+
+    # Nothing new? Stay off the network. A charging session produces samples
+    # every poll, so this only skips genuinely idle cycles — but those are most
+    # of the month, and on a metered host each one would wake the database.
+    if not send_sessions and not samples:
+        with state_lock:
+            charging = bool(poller_state["session_id"])
+        heartbeat_s = SYNC.get("idle_heartbeat_s")
+        heartbeat_s = 86400 if heartbeat_s is None else float(heartbeat_s)
+        last_push   = meta_get("sync_last_push_at")
+        if heartbeat_s <= 0:
+            stale = False          # heartbeat disabled: only real changes go out
+        elif not last_push:
+            stale = True
+        else:
+            try:
+                age = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(last_push)).total_seconds()
+                stale = age >= heartbeat_s
+            except Exception:
+                stale = True
+        if not stale and str(charging) == meta_get("sync_last_charging", ""):
+            return {"sent_sessions": 0, "sent_samples": 0, "more": False, "skipped": True}
+
+    with state_lock:
+        charging_now = bool(poller_state["session_id"])
+
+    # An archive mirror has no live view to feed, so don't spend three charger
+    # round-trips building a snapshot it won't show.
+    status = ({"ok": True, "last_poll": datetime.now(timezone.utc).isoformat(),
+               "vitals": None, "lifetime": None, "version": None, "wifi": None,
+               "current_session": None}
+              if completed_only else build_status())
+
+    reply = post_sync({
+        "sent_at":       datetime.now(timezone.utc).isoformat(),
+        "sessions":      sessions if send_sessions else None,
+        "sessions_hash": fingerprint,
+        "samples":       samples,
+        "config":        {k: CONFIG[k] for k in SYNCED_CONFIG_KEYS if k in CONFIG},
+        "status":        status,
+    })
+    meta_set("sync_last_push_at", datetime.now(timezone.utc).isoformat())
+    meta_set("sync_last_charging", str(charging_now))
+
+    # Advance the sample watermark to whatever the mirror actually holds. If it
+    # was wiped or restored from an older backup it reports a lower id, and the
+    # missing rows go out again on the next pass.
+    mark = samples[-1]["id"] if samples else last_sample
+    meta_set("sync_last_sample_id", min(mark, int(reply.get("max_sample_id") or 0)))
+
+    # Call the sessions table clean only when the mirror echoes the fingerprint
+    # it accepted *and* holds the row count we sent. The count guards against a
+    # mirror whose rows were lost but whose bookkeeping survived.
+    agreed = (reply.get("sessions_hash") == fingerprint
+              and reply.get("sessions_count") == len(sessions))
+    meta_set("sync_sessions_hash", fingerprint if agreed else "")
+    meta_set("sync_last_ok", datetime.now(timezone.utc).isoformat())
+
+    return {
+        "sent_sessions": len(sessions) if send_sessions else 0,
+        "sent_samples":  len(samples),
+        "more":          len(samples) >= batch,
+        "skipped":       False,
+    }
+
+
+def sync_pusher():
+    print(f"Sync → {SYNC['url']} every {SYNC['interval_s']}s")
+    time.sleep(5)   # let the poller take its first reading first
+    while True:
+        try:
+            result = sync_once()
+            if result["sent_sessions"] or result["sent_samples"]:
+                print(f"[sync] {result['sent_sessions']} session(s), "
+                      f"{result['sent_samples']} sample(s) → mirror")
+            # Drain a backlog (first run, or after an outage) without waiting
+            # a full interval per batch. Bounded so a mirror that never
+            # advances its watermark can't spin here.
+            for _ in range(50):
+                if not result["more"]:
+                    break
+                result = sync_once()
+                print(f"[sync] backfill {result['sent_samples']} sample(s)")
+        except urllib.error.HTTPError as exc:
+            print(f"[sync] mirror returned HTTP {exc.code}: {exc.reason}")
+        except Exception as exc:
+            print(f"[sync] failed: {exc}")
+        time.sleep(max(30, int(SYNC.get("interval_s") or 300)))
+
+
+# ── Ingest side (cloud mode) ──────────────────────────────────────────────────
+
+def token_ok(header: str) -> bool:
+    expected = CLOUD.get("sync_token") or ""
+    if not expected or not header.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(header[7:], expected)
+
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    if MODE != "cloud":
+        return jsonify({"error": "this server is not a mirror"}), 400
+
+    raw = request.get_data()
+    if request.headers.get("Content-Encoding") == "gzip":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            return jsonify({"error": "malformed gzip body"}), 400
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return jsonify({"error": "malformed json body"}), 400
+
+    n_sessions = 0
+    rows = payload.get("sessions")
+    if rows:
+        n_sessions = db_exec_many(
+            "INSERT OR REPLACE INTO sessions (" + ", ".join(SESSION_COLUMNS) + ") "
+            "VALUES (" + ",".join("?" * len(SESSION_COLUMNS)) + ")",
+            [tuple(r.get(c) for c in SESSION_COLUMNS) for r in rows],
+        )
+
+    n_samples = db_exec_many(
+        "INSERT OR REPLACE INTO session_samples (" + ", ".join(SAMPLE_COLUMNS) + ") "
+        "VALUES (" + ",".join("?" * len(SAMPLE_COLUMNS)) + ")",
+        [tuple(r.get(c) for c in SAMPLE_COLUMNS) for r in (payload.get("samples") or [])],
+    )
+
+    cfg = payload.get("config")
+    if cfg:
+        with CONFIG_LOCK:
+            for key in SYNCED_CONFIG_KEYS:
+                if key in cfg:
+                    CONFIG[key] = cfg[key]
+            snapshot = {k: CONFIG[k] for k in SYNCED_CONFIG_KEYS if k in CONFIG}
+        meta_set("synced_config", json.dumps(snapshot))
+
+    if payload.get("status") is not None:
+        meta_set("synced_status", json.dumps(payload["status"]))
+
+    meta_set("last_sync_at", datetime.now(timezone.utc).isoformat())
+
+    if rows:
+        meta_set("sessions_hash", payload.get("sessions_hash") or "")
+
+    max_row   = db_one("SELECT MAX(id) AS m FROM session_samples")
+    count_row = db_one("SELECT COUNT(*) AS c FROM sessions")
+    return jsonify({
+        "ok":             True,
+        "sessions":       n_sessions,
+        "samples":        n_samples,
+        "max_sample_id":  (max_row or {}).get("m") or 0,
+        "sessions_hash":  meta_get("sessions_hash", ""),
+        "sessions_count": (count_row or {}).get("c") or 0,
+    })
+
+
+# ── Mirror authentication (cloud mode) ────────────────────────────────────────
+
+def _pbkdf2(password: str, salt: bytes, iterations: int) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations).hex()
+
+
+def hash_password(password: str, iterations: int = 240_000) -> str:
+    salt = secrets.token_bytes(16)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${_pbkdf2(password, salt, iterations)}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iters, salt_hex, want = (stored or "").split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        got = _pbkdf2(password, bytes.fromhex(salt_hex), int(iters))
+    except Exception:
+        return False
+    return hmac.compare_digest(got, want)
+
+
+# Failed-login throttle: client ip → (consecutive failures, blocked-until epoch)
+_login_fails: dict = {}
+_login_lock  = Lock()
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCKOUT_S = 60
+
+
+def client_ip() -> str:
+    # The mirror is expected to sit behind a reverse proxy that sets this.
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return fwd.split(",")[0].strip() if fwd else (request.remote_addr or "?")
+
+
+def login_blocked(ip: str) -> int:
+    with _login_lock:
+        _, until = _login_fails.get(ip, (0, 0.0))
+    remaining = int(until - time.time())
+    return remaining if remaining > 0 else 0
+
+
+def login_record(ip: str, ok: bool):
+    with _login_lock:
+        if ok:
+            _login_fails.pop(ip, None)
+            return
+        fails = _login_fails.get(ip, (0, 0.0))[0] + 1
+        if fails >= LOGIN_MAX_FAILS:
+            _login_fails[ip] = (0, time.time() + LOGIN_LOCKOUT_S)
+        else:
+            _login_fails[ip] = (fails, 0.0)
+
+
+@app.before_request
+def require_login():
+    """Gate every mirror route. No-op in local mode (the LAN server is open)."""
+    if MODE != "cloud":
+        return None
+    path = request.path
+    if path == "/api/sync":
+        if not token_ok(request.headers.get("Authorization", "")):
+            return jsonify({"error": "bad sync token"}), 401
+        return None
+    if path in ("/login", "/healthz"):
+        return None
+    if login_session.get("auth"):
+        return None
+    if path.startswith("/api/"):
+        return jsonify({"error": "login required"}), 401
+    return redirect("/login")
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True, "mode": MODE, "last_sync_at": meta_get("last_sync_at")})
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if MODE != "cloud":
+        return redirect("/")
+    error = ""
+    if request.method == "POST":
+        ip   = client_ip()
+        wait = login_blocked(ip)
+        if wait:
+            error = f"Too many attempts — try again in {wait}s."
+        elif verify_password(request.form.get("password", ""), CLOUD.get("password_hash", "")):
+            login_record(ip, True)
+            login_session.permanent = True
+            login_session["auth"]   = True
+            return redirect("/")
+        else:
+            login_record(ip, False)
+            error = "Incorrect password."
+    banner = f'<div class="err">{error}</div>' if error else ""
+    return Response(LOGIN_HTML.replace("__ERROR__", banner), mimetype="text/html")
+
+
+@app.route("/logout")
+def logout():
+    login_session.clear()
+    return redirect("/login")
+
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wall Connector</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+     background:#15161a;color:#e6e6e6;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.box{width:100%;max-width:340px;padding:28px;background:#1c1e23;border:1px solid #2a2d34;border-radius:10px}
+h1{margin:0 0 4px;font-size:18px}
+p.sub{margin:0 0 20px;font-size:13px;color:#8b8f98}
+label{display:block;font-size:12px;color:#8b8f98;margin-bottom:6px}
+input{width:100%;padding:10px;border-radius:6px;border:1px solid #2a2d34;background:#26282e;
+      color:#e6e6e6;font-size:15px}
+input:focus{outline:none;border-color:#1e5a9c}
+button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:6px;background:#00c853;
+       color:#0d0f12;font-size:15px;font-weight:600;cursor:pointer}
+.err{margin-top:14px;padding:9px 11px;border-radius:6px;background:#3a1d1d;border:1px solid #6b2b2b;
+     color:#ff8a80;font-size:13px}
+</style>
+</head>
+<body>
+  <form class="box" method="post" action="/login">
+    <h1>Wall Connector</h1>
+    <p class="sub">Charge history mirror</p>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+    <button type="submit">Sign in</button>
+    __ERROR__
+  </form>
+</body>
+</html>
+"""
+
+
+# ── Standalone HTML export ────────────────────────────────────────────────────
+#
+# The dashboard is a static page that talks to /api/*. Rather than fork it, the
+# export bakes every API response into the file and swaps in a fetch() that
+# answers from that data — so one template serves the live server, the mirror
+# and the offline copy alike.
+
+def build_offline_payload() -> dict:
+    """Every API response the dashboard asks for, precomputed."""
+    sessions = db_query("SELECT * FROM sessions ORDER BY start_time DESC")
+    for r in sessions:
+        r["cost"]         = session_cost(r)
+        r["duration_fmt"] = fmt_duration(r.get("duration_s"))
+
+    samples = {}
+    for s in sessions:
+        rows = session_samples_with_power(s["id"])
+        if rows:
+            samples[str(s["id"])] = rows
+
+    by_vehicle = db_query(
+        "SELECT vehicle, COUNT(*) as count, SUM(energy_wh) as total_wh, "
+        "SUM(energy_wh / 1000.0 * rate_kwh) as total_cost "
+        "FROM sessions WHERE energy_wh IS NOT NULL GROUP BY vehicle")
+    totals = db_one(
+        "SELECT COUNT(*) as sessions, SUM(energy_wh) as total_wh, "
+        "SUM(energy_wh / 1000.0 * rate_kwh) as total_cost "
+        "FROM sessions WHERE energy_wh IS NOT NULL")
+
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "generated_at": now,
+        "config":   {k: CONFIG[k] for k in SYNCED_CONFIG_KEYS if k in CONFIG},
+        "sessions": sessions,
+        "samples":  samples,
+        "summary":  {"by_vehicle": by_vehicle, "totals": totals},
+        "recent":   recent_per_vehicle_rows(),
+        # No charger behind an offline file, so there is no live session to show.
+        "status":   {"ok": True, "last_poll": now, "vitals": None, "lifetime": None,
+                     "version": None, "wifi": None, "current_session": None},
+    }
+
+
+def export_offline_html(path: str) -> str:
+    """Write the whole history to one self-contained HTML file.
+
+    Written to a temporary name and renamed into place, so a file-syncing
+    service never uploads a half-written page.
+    """
+    payload = build_offline_payload()
+    # A session note containing "</script>" would otherwise close the tag early.
+    data = json.dumps(payload, default=str).replace("</", "<\\/")
+    html = (DASHBOARD_HTML
+            .replace("__MIRROR__",       "true")
+            .replace("__OFFLINE__",      "true")
+            .replace("__OFFLINE_DATA__", data))
+
+    path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(html)
+    os.replace(tmp, path)
+    return path
+
+
+def maybe_export_offline():
+    if not EXPORT.get("enabled") or not EXPORT.get("path"):
+        return
+    try:
+        path = export_offline_html(EXPORT["path"])
+        size = os.path.getsize(path) / 1e6
+        print(f"Offline copy written → {path} ({size:.1f} MB)")
+    except Exception as exc:
+        print(f"Offline export failed: {exc}")
+
+
 # ── Web dashboard ─────────────────────────────────────────────────────────────
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -611,7 +1298,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wall Connector</title>
-<script>(function(){const t=localStorage.getItem('wc-theme');if(t)document.documentElement.dataset.theme=t})();</script>
+<script>(function(){try{const t=localStorage.getItem('wc-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}})();</script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1/dist/html2canvas.min.js"></script>
 <style>
@@ -793,7 +1480,7 @@ select.filter{background:var(--bg3);border:1px solid var(--border2);color:var(--
   <div class="header-right">
     <span id="poll-ts">–</span>
     <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">◑</button>
-    <a class="nav-link" href="/settings">Settings</a>
+    <span id="nav-links"></span>
   </div>
 </header>
 
@@ -953,7 +1640,7 @@ function isLight() {
 }
 function toggleTheme() {
   document.documentElement.dataset.theme = isLight() ? 'dark' : 'light';
-  localStorage.setItem('wc-theme', document.documentElement.dataset.theme);
+  try { localStorage.setItem('wc-theme', document.documentElement.dataset.theme); } catch (e) {}
   updateThemeBtn(); redrawCharts();
 }
 function updateThemeBtn() {
@@ -984,10 +1671,57 @@ function vehicleColor(name) {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
+const MIRROR  = __MIRROR__;   // read-only copy — no charger, no edits
+const OFFLINE = __OFFLINE__;  // standalone file: every API response baked in below
+const OFFLINE_DATA = __OFFLINE_DATA__;
+if (OFFLINE) installOfflineFetch();
+
+// Answer the dashboard's own /api/* calls from the inlined snapshot, so the
+// page works identically whether a server is behind it or not.
+function installOfflineFetch() {
+  const D = OFFLINE_DATA;
+  const reply = body => Promise.resolve({
+    ok: true, status: 200,
+    json: () => Promise.resolve(body),
+    text: () => Promise.resolve(JSON.stringify(body)),
+  });
+  window.fetch = (input, init) => {
+    if (init && init.method && init.method !== 'GET') return reply({});   // read-only
+    const u = new URL(String(input), 'http://offline.local');
+    const p = u.pathname, q = u.searchParams;
+
+    if (p === '/api/status')   return reply(D.status);
+    if (p === '/api/config')   return reply(D.config);
+    if (p === '/api/summary')  return reply(D.summary);
+    if (p === '/api/lifetime') return reply({});
+    if (p === '/api/sessions/recent-per-vehicle') return reply(D.recent);
+
+    let m = p.match(/^\/api\/sessions\/(\d+)\/samples$/);
+    if (m) return reply(D.samples[m[1]] || []);
+    m = p.match(/^\/api\/sessions\/(\d+)$/);
+    if (m) return reply(D.sessions.find(s => String(s.id) === m[1]) || {});
+
+    if (p === '/api/sessions') {
+      let rows = D.sessions;
+      const days = parseInt(q.get('days'), 10);
+      if (days) {
+        const cutoff = new Date(Date.now() - days*86400000).toISOString();
+        rows = rows.filter(s => s.start_time && s.start_time >= cutoff);
+      }
+      const month = q.get('month');
+      if (month) rows = rows.filter(s => (s.start_time || '').slice(0,7) === month);
+      const veh = q.get('vehicle');
+      if (veh) rows = rows.filter(s => (s.vehicle || '').toLowerCase() === veh.toLowerCase());
+      return reply(rows);
+    }
+    return reply({});
+  };
+}
 let currentDays      = 7;
 let currentVehicle   = '';
 let vehicleNames     = ['Unknown'];
-let vehicleCapacities = {};       // name → capacity_kwh
+let vehicleCapacities = {};       // name → capacity_kwh (nominal)
+let vehicleSOH        = {};       // name → soh_pct (100 if not degraded)
 let liveSessionId    = null;
 let liveAxis         = 'energy';
 let liveChart        = null;
@@ -1026,7 +1760,9 @@ function socColor(pct) {
   return pct<20?'#f44336':pct<50?'#ff9800':pct<80?'#00c853':'#64b5f6';
 }
 function updateSOC() {
-  const cap    = vehicleCapacities[liveVehicleName] || 0;
+  const nomCap = vehicleCapacities[liveVehicleName] || 0;
+  const soh    = vehicleSOH[liveVehicleName] ?? 100;
+  const cap    = nomCap * soh / 100;
   const arcEl  = document.getElementById('soc-arc');
   const pctEl  = document.getElementById('soc-pct');
   const noteEl = document.getElementById('soc-note');
@@ -1039,14 +1775,16 @@ function updateSOC() {
     arcEl.setAttribute('d','');
     return;
   }
-  noteEl.textContent = `${cap} kWh battery`;
+  noteEl.textContent = soh < 100
+    ? `${nomCap} kWh × ${soh}% SOH = ${cap.toFixed(1)} kWh`
+    : `${cap.toFixed(1)} kWh battery`;
 
   const startEl = document.getElementById('soc-start');
   const start   = parseFloat(startEl.value);
   if (isNaN(start)) { pctEl.textContent='–'; arcEl.setAttribute('d',''); return; }
 
-  if (liveSessionId) {
-    localStorage.setItem('wc-soc-'+liveSessionId, String(start));
+  if (liveSessionId && !MIRROR) {
+    try { localStorage.setItem('wc-soc-'+liveSessionId, String(start)); } catch (e) {}
     clearTimeout(_socSaveTimer);
     _socSaveTimer = setTimeout(() => {
       fetch(`/api/sessions/${liveSessionId}`, {
@@ -1089,9 +1827,21 @@ async function loadStatus() {
     const d  = await fetch('/api/status').then(r=>r.json());
     const v  = d.vitals || {}, cs = d.current_session;
 
-    document.getElementById('conn-dot').className = 'dot '+(d.ok?'green':'red');
-    document.getElementById('poll-ts').textContent = d.last_poll
-      ? 'Updated '+new Date(d.last_poll).toLocaleTimeString() : '–';
+    if (OFFLINE) {
+      document.getElementById('conn-dot').className = 'dot amber';
+      document.getElementById('poll-ts').textContent =
+        'Exported ' + new Date(OFFLINE_DATA.generated_at).toLocaleString();
+    } else if (MIRROR) {
+      // The mirror shows a snapshot, so "fresh" means recently synced.
+      const ageMin = d.synced_at ? (Date.now()-new Date(d.synced_at).getTime())/60000 : Infinity;
+      document.getElementById('conn-dot').className = 'dot '+(ageMin<15?'green':ageMin<60?'amber':'red');
+      document.getElementById('poll-ts').textContent = d.synced_at
+        ? 'Synced '+new Date(d.synced_at).toLocaleString() : 'Awaiting first sync';
+    } else {
+      document.getElementById('conn-dot').className = 'dot '+(d.ok?'green':'red');
+      document.getElementById('poll-ts').textContent = d.last_poll
+        ? 'Updated '+new Date(d.last_poll).toLocaleTimeString() : '–';
+    }
 
     document.getElementById('s-grid').textContent =
       v.grid_v ? `${v.grid_v.toFixed(1)} V / ${v.grid_hz?v.grid_hz.toFixed(2):'–'} Hz` : '–';
@@ -1126,7 +1876,8 @@ async function loadStatus() {
         if (cs.start_soc != null) {
           startEl.value = cs.start_soc;
         } else {
-          startEl.value = localStorage.getItem('wc-soc-'+liveSessionId) || '';
+          try { startEl.value = localStorage.getItem('wc-soc-'+liveSessionId) || ''; }
+          catch (e) { startEl.value = ''; }
         }
       }
       liveVehicleName  = cs.vehicle || '';
@@ -1213,7 +1964,7 @@ async function loadSessions() {
       <td class="td-date" data-label="Date">${dateStr}</td>
       <td class="td-time" data-label="Start">${timeStr}</td>
       <td class="td-vehicle">
-        <select class="vehicle-select ${vClass}" onchange="patchSession(${row.id},'vehicle',this.value,this)">
+        <select class="vehicle-select ${vClass}" ${MIRROR?'disabled':''} onchange="patchSession(${row.id},'vehicle',this.value,this)">
           ${vehicleNames.map(n=>`<option ${vehicle===n?'selected':''}>${n}</option>`).join('')}
           ${vehicleNames.includes(vehicle)?'':`<option selected>${vehicle}</option>`}
         </select>
@@ -1223,8 +1974,9 @@ async function loadSessions() {
       <td class="td-dur num" data-label="Duration">${dur?fmtDur(dur):'–'}</td>
       <td class="td-rate num" data-label="Rate" style="font-size:11px;color:var(--label)">$${(row.rate_kwh||0).toFixed(4)}</td>
       <td class="td-cost num" data-label="Cost">$${(row.cost||0).toFixed(2)}</td>
-      <td class="td-soc" data-label="SOC" style="white-space:nowrap"><input class="soc-end-inp" type="number" min="0" max="100" value="${row.start_soc??''}" placeholder="?" style="width:36px" onblur="patchSoc(${row.id},'start_soc',this.value)" onkeydown="if(event.key==='Enter')this.blur()"><span style="font-size:10px;color:var(--label);margin:0 2px">→</span><input class="soc-end-inp" type="number" min="0" max="100" value="${row.end_soc??''}" placeholder="?" style="width:36px" onblur="patchSoc(${row.id},'end_soc',this.value)" onkeydown="if(event.key==='Enter')this.blur()"></td>
+      <td class="td-soc" data-label="SOC" style="white-space:nowrap"><input class="soc-end-inp" type="number" min="0" max="100" value="${row.start_soc??''}" placeholder="?" style="width:36px" ${MIRROR?'disabled':''} onblur="patchSoc(${row.id},'start_soc',this.value)" onkeydown="if(event.key==='Enter')this.blur()"><span style="font-size:10px;color:var(--label);margin:0 2px">→</span><input class="soc-end-inp" type="number" min="0" max="100" value="${row.end_soc??''}" placeholder="?" style="width:36px" ${MIRROR?'disabled':''} onblur="patchSoc(${row.id},'end_soc',this.value)" onkeydown="if(event.key==='Enter')this.blur()"></td>
       <td class="td-notes" data-label="Notes"><input class="note-input" value="${(row.notes||'').replace(/"/g,'&quot;')}"
+            ${MIRROR?'disabled':''}
             onblur="patchSession(${row.id},'notes',this.value,null)"
             onkeydown="if(event.key==='Enter')this.blur()"></td>
       <td class="td-trend"><button class="trend-btn" onclick="showChart(${row.id},'${vehicle}',${wh/1000})">Trend</button></td>`;
@@ -1300,6 +2052,7 @@ function addCard(grid,label,value,sub) {
 }
 
 async function patchSession(id,field,value,selectEl) {
+  if (MIRROR) return;   // read-only; the server rejects it anyway
   const u=await fetch(`/api/sessions/${id}`,{
     method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({[field]:value})
   }).then(r=>r.json());
@@ -1325,7 +2078,11 @@ async function loadConfig() {
     if (!vehicleNames.includes('Unknown')) vehicleNames.push('Unknown');
 
     vehicleCapacities={};
-    for (const v of (c.vehicles||[])) vehicleCapacities[v.name]=v.capacity_kwh||0;
+    vehicleSOH={};
+    for (const v of (c.vehicles||[])) {
+      vehicleCapacities[v.name] = v.capacity_kwh || 0;
+      vehicleSOH[v.name]        = v.soh_pct != null ? v.soh_pct : 100;
+    }
 
     const filter=document.getElementById('vehicle-filter');
     const prev=filter.value;
@@ -1355,7 +2112,9 @@ async function loadEfficiency() {
     const all = await fetch('/api/sessions').then(r => r.json());
     vehicleEfficiency = {};
     for (const name of vehicleNames) {
-      const cap = vehicleCapacities[name] || 0;
+      const nomCap = vehicleCapacities[name] || 0;
+      const soh  = vehicleSOH[name] ?? 100;
+      const cap  = nomCap * soh / 100;
       if (!cap) continue;
       const calibrated = all.filter(s =>
         s.vehicle === name &&
@@ -1825,16 +2584,35 @@ document.getElementById('chart-modal').addEventListener('click',e=>{
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+document.getElementById('nav-links').innerHTML = OFFLINE
+  ? '<span class="nav-link" style="cursor:default" title="Standalone snapshot exported from the home server">Offline copy</span>'
+  : MIRROR
+  ? '<span class="nav-link" style="cursor:default" title="Read-only copy synced from the home server">Mirror</span>'
+    + '<a class="nav-link" href="/logout">Log out</a>'
+  : '<a class="nav-link" href="/settings">Settings</a>';
+if (MIRROR) {
+  const socInp = document.getElementById('soc-start');
+  if (socInp) { socInp.disabled = true; socInp.placeholder = '–'; }
+}
 loadConfig().then(loadEfficiency);
 loadStatus();
 loadSessions();
 updateStatsNav(); loadStats();
 loadRecentPerVehicle();
-setInterval(loadStatus,           30000);
-setInterval(loadSessions,         60000);
-setInterval(loadStats,           120000);
-setInterval(loadRecentPerVehicle, 120000);
-setInterval(loadEfficiency,       300000);
+// Only poll while the tab is actually being looked at. A forgotten background
+// tab otherwise polls all night — which costs nothing on the Pi, but keeps a
+// metered mirror's database awake around the clock.
+function whileVisible(fn) { return () => { if (!document.hidden) fn(); }; }
+if (!OFFLINE) {   // a static file has nothing new to fetch
+  setInterval(whileVisible(loadStatus),           30000);
+  setInterval(whileVisible(loadSessions),         60000);
+  setInterval(whileVisible(loadStats),           120000);
+  setInterval(whileVisible(loadRecentPerVehicle), 120000);
+  setInterval(whileVisible(loadEfficiency),      300000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { loadStatus(); loadSessions(); }
+  });
+}
 </script>
 </body>
 </html>
@@ -1846,7 +2624,7 @@ SETTINGS_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Wall Connector — Settings</title>
-<script>(function(){const t=localStorage.getItem('wc-theme');if(t)document.documentElement.dataset.theme=t})();</script>
+<script>(function(){try{const t=localStorage.getItem('wc-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}})();</script>
 <style>
 :root{
   --bg:#161616;--bg2:#1e1e1e;--bg3:#252525;
@@ -1884,9 +2662,9 @@ input[type=text],input[type=number]{background:var(--bg3);border:1px solid var(-
 input:focus{outline:none;border-color:var(--blue-bd)}
 
 /* Vehicle table */
-.v-header{display:grid;grid-template-columns:1fr 76px 80px 80px 32px;gap:8px;margin-bottom:4px;padding:0 2px}
+.v-header{display:grid;grid-template-columns:1fr 76px 80px 58px 80px 32px;gap:8px;margin-bottom:4px;padding:0 2px}
 .v-header span{font-size:11px;color:var(--label)}
-.vehicle-row{display:grid;grid-template-columns:1fr 76px 80px 80px 32px;gap:8px;align-items:center;margin-bottom:8px}
+.vehicle-row{display:grid;grid-template-columns:1fr 76px 80px 58px 80px 32px;gap:8px;align-items:center;margin-bottom:8px}
 .check-wrap{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text2);justify-content:center}
 input[type=checkbox]{accent-color:#00c853;width:15px;height:15px;cursor:pointer;flex-shrink:0}
 .del-btn{background:var(--bg3);border:1px solid var(--border2);color:var(--label);width:28px;height:28px;border-radius:4px;cursor:pointer;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center}
@@ -1903,7 +2681,7 @@ input[type=checkbox]{accent-color:#00c853;width:15px;height:15px;cursor:pointer;
   .container{padding:16px}
 }
 @media(max-width:540px){
-  .v-header,.vehicle-row{grid-template-columns:1fr 64px 70px 70px 28px;gap:6px}
+  .v-header,.vehicle-row{grid-template-columns:1fr 64px 70px 52px 70px 28px;gap:6px}
 }
 @media(max-width:480px){
   .v-header{display:none}
@@ -1934,13 +2712,14 @@ input[type=checkbox]{accent-color:#00c853;width:15px;height:15px;cursor:pointer;
       <span>Name</span>
       <span>Max (kW)</span>
       <span>Battery (kWh)</span>
+      <span>SOH %</span>
       <span style="text-align:center">EV off-peak</span>
       <span></span>
     </div>
     <div id="vehicles-list"></div>
     <button class="add-btn" onclick="addVehicle()">+ Add vehicle</button>
   </div>
-  <p class="note">Max power is used for auto-detection. Battery capacity is used for the live SOC gauge.</p>
+  <p class="note">Max power is used for auto-detection. Battery capacity and SOH % are used for the live SOC gauge — set SOH % to the battery's state of health if degraded (e.g. 56 for a 30 kWh battery at 55.83% SOH = 16.7 kWh effective).</p>
 
   <h2>Electricity Rates</h2>
   <div class="card">
@@ -1987,7 +2766,7 @@ function isLight() {
 }
 function toggleTheme() {
   document.documentElement.dataset.theme = isLight() ? 'dark' : 'light';
-  localStorage.setItem('wc-theme', document.documentElement.dataset.theme);
+  try { localStorage.setItem('wc-theme', document.documentElement.dataset.theme); } catch (e) {}
   updateThemeBtn();
 }
 function updateThemeBtn() {
@@ -2012,14 +2791,16 @@ function renderVehicles(vehicles) {
   const list = document.getElementById('vehicles-list');
   list.innerHTML = '';
   vehicles.forEach((v, i) => {
-    const maxKw = v.max_power_w ? (v.max_power_w / 1000).toFixed(1) : '';
+    const maxKw  = v.max_power_w ? (v.max_power_w / 1000).toFixed(1) : '';
     const capKwh = v.capacity_kwh || '';
+    const sohPct = v.soh_pct != null ? v.soh_pct : 100;
     const row = document.createElement('div');
     row.className = 'vehicle-row';
     row.innerHTML = `
       <input type="text"   value="${v.name||''}"   oninput="updateV(${i},'name',this.value)"                              placeholder="Name">
       <input type="number" value="${maxKw}"         oninput="updateV(${i},'max_power_w',Math.round(+this.value*1000))"    placeholder="kW"  min="0" step="0.1">
       <input type="number" value="${capKwh}"        oninput="updateV(${i},'capacity_kwh',+this.value)"                    placeholder="kWh" min="0" step="0.1">
+      <input type="number" value="${sohPct}"        oninput="updateV(${i},'soh_pct',+this.value)"                         placeholder="100" min="1" max="100" step="0.1">
       <div class="check-wrap">
         <input type="checkbox" ${v.ev_powerup?'checked':''} onchange="updateV(${i},'ev_powerup',this.checked)">
       </div>
@@ -2032,7 +2813,7 @@ function updateV(i, key, val) { cfg.vehicles[i][key] = val; }
 function removeV(i) { cfg.vehicles.splice(i,1); renderVehicles(cfg.vehicles); }
 function addVehicle() {
   if (!cfg.vehicles) cfg.vehicles = [];
-  cfg.vehicles.push({name:'', max_power_w:0, capacity_kwh:0, ev_powerup:false});
+  cfg.vehicles.push({name:'', max_power_w:0, capacity_kwh:0, soh_pct:100, ev_powerup:false});
   renderVehicles(cfg.vehicles);
 }
 
@@ -2063,37 +2844,73 @@ load();
 
 @app.route("/settings")
 def settings():
+    if MODE == "cloud":
+        return redirect("/")   # rates and vehicles are owned by the home server
     return Response(SETTINGS_HTML, mimetype="text/html")
 
 
 @app.route("/")
 def dashboard():
-    return Response(DASHBOARD_HTML, mimetype="text/html")
+    # __MIRROR__ is the only build-time token in the template, so the Netlify
+    # mirror can generate its own copy from this same HTML (see
+    # netlify-mirror/scripts/build-dashboard.mjs) instead of forking it.
+    html = (DASHBOARD_HTML
+            .replace("__MIRROR__",       "true" if MODE == "cloud" else "false")
+            .replace("__OFFLINE__",      "false")
+            .replace("__OFFLINE_DATA__", "null"))
+    return Response(html, mimetype="text/html")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
-    p = argparse.ArgumentParser(description="Wall Connector server")
-    p.add_argument("--port",   type=int, default=8090)
-    p.add_argument("--host",   default="0.0.0.0", help="Bind address")
-    p.add_argument("--wc-ip",  dest="wc_ip", help="Wall Connector IP (overrides config.json)")
-    args = p.parse_args()
+def persist_cloud_key(key: str, value: str):
+    """Write one key back into config.json's cloud block, leaving the rest alone."""
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+    cfg.setdefault("cloud", {})[key] = value
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=4)
 
-    # Load config.json then apply CLI overrides
+
+def configure(mode=None, config_path=None, db_path=None, wc_ip=None, resync=False):
+    """Load config, set up the database, and start the background threads.
+
+    Shared by the CLI entry point and the WSGI factory.
+    """
+    global WC_IP, MODE, CONFIG_PATH, DB_PATH
+    if config_path:
+        CONFIG_PATH = os.path.abspath(config_path)
+
     cfg = {}
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
-    elif not args.wc_ip:
-        print(f"ERROR: config.json not found and --wc-ip not set.\n"
-              f"Copy config.example.json → config.json and set wc_ip.")
-        sys.exit(1)
 
-    global WC_IP
-    WC_IP = args.wc_ip or cfg.get("wc_ip", "")
-    if not WC_IP:
-        print("ERROR: wc_ip not set. Add it to config.json or use --wc-ip.")
+    # --db beats config.json beats "next to this script"
+    if db_path:
+        DB_PATH = os.path.abspath(os.path.expanduser(db_path))
+    elif cfg.get("db_path"):
+        DB_PATH = os.path.abspath(os.path.expanduser(cfg["db_path"]))
+
+    MODE = mode or cfg.get("mode", "local")
+
+    if MODE == "local":
+        if not cfg and not wc_ip:
+            print(f"ERROR: {os.path.basename(CONFIG_PATH)} not found and --wc-ip not set.\n"
+                  f"Copy config.example.json → config.json and set wc_ip.")
+            sys.exit(1)
+        WC_IP = wc_ip or cfg.get("wc_ip", "")
+        if not WC_IP:
+            print("ERROR: wc_ip not set. Add it to config.json or use --wc-ip.")
+            sys.exit(1)
+    elif not cfg:
+        print(f"ERROR: {os.path.basename(CONFIG_PATH)} not found.\n"
+              f"Copy config.cloud.example.json → config.json on the mirror host.")
         sys.exit(1)
 
     # Populate live CONFIG from file (handle old vehicles: ["A","B"] format)
@@ -2108,12 +2925,160 @@ def main():
         "offpeak_end_hour":    cfg.get("offpeak_end_hour",    CONFIG["offpeak_end_hour"]),
         "vehicles":            raw_vehicles,
     })
+    SYNC.update(cfg.get("sync")   or {})
+    CLOUD.update(cfg.get("cloud") or {})
+    EXPORT.update(cfg.get("offline_export") or {})
 
+    if MODE == "cloud":
+        if not CLOUD.get("sync_token"):
+            print("ERROR: cloud.sync_token is not set. Generate one with --gen-token "
+                  "and use the same value in the home server's sync.token.")
+            sys.exit(1)
+        if not CLOUD.get("password_hash"):
+            print("ERROR: cloud.password_hash is not set. Create one with --hash-password.")
+            sys.exit(1)
+        if not CLOUD.get("secret_key"):
+            CLOUD["secret_key"] = secrets.token_urlsafe(48)
+            persist_cloud_key("secret_key", CLOUD["secret_key"])
+            print("Generated a new cookie signing key in config.json.")
+        app.secret_key = CLOUD["secret_key"]
+        app.permanent_session_lifetime = timedelta(days=30)
+        app.config.update(
+            SESSION_COOKIE_HTTPONLY=True,
+            SESSION_COOKIE_SAMESITE="Lax",
+            SESSION_COOKIE_SECURE=bool(CLOUD.get("require_https", True)),
+            MAX_CONTENT_LENGTH=64 * 1024 * 1024,
+        )
+
+    warn_if_cloud_synced(DB_PATH)
     init_db()
-    recalc_session_durations()
 
-    poll_thread = Thread(target=poller, daemon=True)
-    poll_thread.start()
+    if MODE == "local":
+        recalc_session_durations()
+        Thread(target=poller, daemon=True).start()
+
+        if SYNC.get("enabled"):
+            if not SYNC.get("url") or not SYNC.get("token"):
+                print("WARNING: sync.enabled is true but sync.url/sync.token are unset "
+                      "— not syncing.")
+            else:
+                if resync:
+                    meta_set("sync_last_sample_id", 0)
+                    meta_set("sync_sessions_hash", "")
+                    print("Full re-push queued.")
+                Thread(target=sync_pusher, daemon=True).start()
+        elif resync:
+            print("WARNING: --resync ignored because sync.enabled is false.")
+
+        if EXPORT.get("enabled"):
+            if not EXPORT.get("path"):
+                print("WARNING: offline_export.enabled is true but no path is set.")
+            else:
+                maybe_export_offline()   # refresh at startup, then on each session
+    else:
+        saved = meta_get("synced_config")
+        if saved:
+            try:
+                CONFIG.update(json.loads(saved))
+            except Exception:
+                pass
+        print("Cloud mirror mode — read-only; no charger polling.")
+        print(f"Last sync: {meta_get('last_sync_at') or 'never'}")
+
+    return app
+
+
+def create_app():
+    """WSGI factory, for running the mirror under a production server:
+
+        gunicorn -w 1 --threads 8 -b 127.0.0.1:8090 'wc_server:create_app()'
+
+    Configured through the environment: WC_MODE, WC_CONFIG, WC_DB.
+    Use a single worker — the SQLite database and the in-process poller state
+    are not shared between processes.
+    """
+    return configure(
+        mode=os.environ.get("WC_MODE"),
+        config_path=os.environ.get("WC_CONFIG"),
+        db_path=os.environ.get("WC_DB"),
+    )
+
+
+def main():
+    p = argparse.ArgumentParser(description="Wall Connector server")
+    p.add_argument("--port",   type=int, default=8090)
+    p.add_argument("--host",   default="0.0.0.0", help="Bind address")
+    p.add_argument("--wc-ip",  dest="wc_ip", help="Wall Connector IP (overrides config.json)")
+    p.add_argument("--mode",   choices=("local", "cloud"),
+                   help="local = poll the charger (default); cloud = internet mirror")
+    p.add_argument("--config", dest="config_path", help="Path to config.json")
+    p.add_argument("--db",     dest="db_path",     help="Path to the SQLite database")
+    p.add_argument("--resync", action="store_true",
+                   help="Local mode: re-push the entire history to the mirror")
+    p.add_argument("--migrate-db", dest="migrate_db", metavar="DEST",
+                   help="Copy the database to DEST, verify it, and point config.json there")
+    p.add_argument("--export-offline", dest="export_offline", metavar="PATH", nargs="?",
+                   const="", help="Write the standalone HTML history file and exit "
+                                  "(PATH defaults to offline_export.path)")
+    p.add_argument("--gen-token", action="store_true",
+                   help="Print a random shared sync token and exit")
+    p.add_argument("--hash-password", action="store_true",
+                   help="Prompt for a mirror password, print its hash, and exit")
+    args = p.parse_args()
+
+    if args.gen_token:
+        print(secrets.token_urlsafe(32))
+        return
+
+    if args.migrate_db:
+        global CONFIG_PATH, DB_PATH
+        if args.config_path:
+            CONFIG_PATH = os.path.abspath(args.config_path)
+        cfg = {}
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        if args.db_path:
+            DB_PATH = os.path.abspath(os.path.expanduser(args.db_path))
+        elif cfg.get("db_path"):
+            DB_PATH = os.path.abspath(os.path.expanduser(cfg["db_path"]))
+        sys.exit(migrate_db(args.migrate_db))
+
+    if args.hash_password:
+        pw1 = getpass.getpass("Mirror password: ")
+        pw2 = getpass.getpass("Repeat: ")
+        if not pw1 or pw1 != pw2:
+            print("Passwords are empty or do not match.")
+            sys.exit(1)
+        print("\nAdd to the mirror's config.json:\n")
+        print(json.dumps({"cloud": {"password_hash": hash_password(pw1)}}, indent=4))
+        return
+
+    if args.export_offline is not None:
+        # Load config and open the database, but don't start the poller.
+        if args.config_path:
+            globals()["CONFIG_PATH"] = os.path.abspath(args.config_path)
+        cfg = {}
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        if args.db_path:
+            globals()["DB_PATH"] = os.path.abspath(os.path.expanduser(args.db_path))
+        elif cfg.get("db_path"):
+            globals()["DB_PATH"] = os.path.abspath(os.path.expanduser(cfg["db_path"]))
+        CONFIG.update({k: cfg[k] for k in SYNCED_CONFIG_KEYS if k in cfg})
+        EXPORT.update(cfg.get("offline_export") or {})
+        target = args.export_offline or EXPORT.get("path")
+        if not target:
+            print("ERROR: no path given and offline_export.path is not set.")
+            sys.exit(1)
+        init_db()
+        path = export_offline_html(target)
+        print(f"Wrote {path} ({os.path.getsize(path)/1e6:.1f} MB)")
+        return
+
+    configure(mode=args.mode, config_path=args.config_path,
+              db_path=args.db_path, wc_ip=args.wc_ip, resync=args.resync)
 
     def shutdown(sig, _frame):
         print("\nShutting down.")
