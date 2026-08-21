@@ -212,6 +212,33 @@ Nothing about the server changes: it already binds `0.0.0.0`, so it is reachable
 
 If you'd rather not install anything on your phone, use the offline copy below instead.
 
+## Backups
+
+The tracker's database is the only record of your charging history — the charger itself exposes only the *current* session, so anything lost is lost for good. If the server runs on a Raspberry Pi, that history lives on an SD card.
+
+`wc_backup.py` pulls a running tracker's full history over its REST API into a local SQLite file:
+
+```bash
+python3 wc_backup.py http://192.168.86.64:8090 --out ~/Dropbox/Charging/wc-history.db
+```
+
+It reads only over HTTP, so the machine holding the data needs no extra software, no SSH access and no code changes — it works against any version of the server, including one you haven't upgraded.
+
+Run it on a schedule from any always-on machine on the same network. A `launchd` example is in [launchd.backup.plist.example](launchd.backup.plist.example); on Linux use a cron entry or systemd timer. Every six hours is ample.
+
+### What makes it safe to leave unattended
+
+- **The existing backup is never damaged.** The new copy is assembled in a `.partial` file and only swapped into place — atomically — once `integrity_check` passes and the session count matches the source.
+- **An unreachable source is not a failure that costs you anything.** If the machine is asleep, off the network, or answering with something that isn't the tracker, the run exits non-zero and leaves the previous backup byte-identical.
+- **A corrupt backup can't become permanent.** If the existing file can't be read, it is renamed to `.unreadable-<timestamp>` and rebuilt from scratch rather than blocking every future run.
+- **Routine runs are nearly free.** Samples for finished sessions are fetched once and reused, so a run with nothing new costs a single HTTP request and about half a second.
+
+The backup records where it came from and when, plus the source's rates and vehicles, in a `backup_meta` table.
+
+### Backing up into a synced folder
+
+Writing the backup into Dropbox or iCloud is a good idea, and does **not** contradict the warning below about the live database. The hazard there is a database being actively written by a running server while a sync client copies it mid-write. A backup is written once, verified, closed, and moved into place atomically — there is never a `-wal` file beside it and no process holds it open. Syncing it gives you an offsite copy and file version history for free.
+
 ## Where the database lives
 
 By default `wc_sessions.db` sits next to `wc_server.py`. Point it somewhere else with `db_path` in `config.json`, or `--db`:
