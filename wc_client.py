@@ -10,7 +10,7 @@ Usage:
     python3 wc_client.py note <session_id> <text>
 
 Set WC_SERVER env var to override default (http://localhost:8090):
-    WC_SERVER=http://192.168.86.10:8090 python3 wc_client.py status
+    WC_SERVER=http://192.168.1.50:8090 python3 wc_client.py status
 """
 
 import argparse

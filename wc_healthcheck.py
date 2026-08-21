@@ -7,9 +7,9 @@ Run it before an upgrade, run it again afterwards, and it will tell you whether
 anything was lost. It only reads the REST API, so it works against a server on
 another machine and needs no access to that machine's filesystem.
 
-    python3 wc_healthcheck.py http://192.168.86.64:8090 --save before.json
+    python3 wc_healthcheck.py http://192.168.1.50:8090 --save before.json
     # ... deploy ...
-    python3 wc_healthcheck.py http://192.168.86.64:8090 --compare before.json
+    python3 wc_healthcheck.py http://192.168.1.50:8090 --compare before.json
 
 Exit status is 0 when healthy (or when a comparison shows no loss), 1 otherwise,
 so it can gate a scripted deploy.

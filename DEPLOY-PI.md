@@ -1,18 +1,18 @@
 # Deploying to the Raspberry Pi
 
-Upgrading the tracker on `raspberrypi4` (`192.168.86.64`) from the legacy build to the current one.
+Upgrading the tracker on a Raspberry Pi from an older build to the current one. Substitute your own host address and paths throughout.
 
-Written to be run by you, from the Mac and over SSH. Some steps are **discovery** rather than instructions: the Pi's install layout was never inspected, so it has to be confirmed on the day.
+Run from another machine over SSH. Some steps are **discovery** rather than instructions: install layouts vary, so confirm yours rather than assuming.
 
 ---
 
 ## Read this first
 
-**The Pi holds the only complete copy of your charge history** — 91 sessions, 1,189.7 kWh, $321.94 as of 21 Aug 2026. There is no second copy anywhere. Step 1 exists for that reason; don't skip it.
+**The Pi may hold the only complete copy of your charge history.** Unless you already have backups running, there is no second copy anywhere. Step 1 exists for that reason; don't skip it.
 
 **No sessions are recorded while the server is stopped.** If a car charges during the deploy, that session is lost permanently — the Wall Connector only exposes the *current* session, so there's nothing to backfill from. Do this when nothing is plugged in.
 
-**Never copy `config.json` from the Mac to the Pi.** They differ: the Pi's off-peak window starts at 21:00, the Mac's at 22:00. Copying would silently re-rate sessions. Only `wc_server.py` gets deployed.
+**Never copy `config.json` between machines.** Two installs will have drifted — different rates, a different off-peak window — and overwriting one silently re-rates its history. Only `wc_server.py` gets deployed.
 
 ---
 
@@ -38,17 +38,17 @@ Requirements are unchanged: Python 3.9+, Flask, standard library only. No new de
 
 ## Getting in
 
-The SSH user is **`pi`** (`ssh pi@192.168.86.64`). The Pi accepts both `publickey` and `password`.
+The SSH user is **`pi`** (`ssh pi@192.168.1.50`). The Pi accepts both `publickey` and `password`.
 
-Your keys are on the **Mac Studio**, not the MacBook — so the simplest route is to run this from the Mac Studio, where `ssh pi@192.168.86.64` already works without a prompt.
+If one of your machines already has key access to the Pi, run the deploy from there and skip this section.
 
-To work from the MacBook instead, install its key on the Pi once. This prompts for the Pi's password, which you type yourself:
+Otherwise install your key on the Pi once. This prompts for the Pi's password:
 
 ```bash
-ssh-copy-id -i ~/.ssh/id_ed25519_codex_macbook.pub pi@192.168.86.64
+ssh-copy-id -i ~/.ssh/id_ed25519.pub pi@192.168.1.50
 ```
 
-After that, `scp` and `ssh` from the MacBook work without a prompt for the rest of the deploy.
+After that, `ssh` and `scp` work without a prompt for the rest of the deploy.
 
 > There is no "default" password to fall back on. Raspberry Pi OS dropped the old `pi`/`raspberry` default in the Bullseye release (April 2022); current images make you set one at first boot. If it's genuinely lost, the recovery route is editing the SD card on another machine — a bigger detour than it's worth mid-deploy, so confirm you can log in *before* stopping anything.
 
@@ -59,10 +59,10 @@ After that, `scp` and `ssh` from the MacBook work without a prompt for the rest 
 ### 1a. Record the Pi's current state (from the Mac)
 
 ```bash
-python3 wc_healthcheck.py http://192.168.86.64:8090 --save ~/Desktop/pi-before.json
+python3 wc_healthcheck.py http://192.168.1.50:8090 --save ~/Desktop/pi-before.json
 ```
 
-Expect `legacy build`, 91 sessions, `polling: ok`. This file is what proves afterwards that nothing was lost.
+Note the session count it reports and check `polling: ok`. This file is what proves afterwards that nothing was lost.
 
 ### 1b. Back up the database on the Pi
 
@@ -79,14 +79,14 @@ print('integrity:', dst.execute('pragma integrity_check').fetchone()[0])
 "
 ```
 
-This uses SQLite's backup API, so it's a consistent snapshot even with the server running. It should print **91 sessions** and **integrity: ok**.
+This uses SQLite's backup API, so it's a consistent snapshot even with the server running. It should print the same session count as step 1a, and **integrity: ok**.
 
 ### 1c. Copy that backup off the Pi
 
 A backup on the same SD card doesn't protect against the SD card. From the Mac:
 
 ```bash
-scp pi@192.168.86.64:<path>/wc_sessions.backup-*.db ~/Desktop/
+scp pi@192.168.1.50:<path>/wc_sessions.backup-*.db ~/Desktop/
 ```
 
 **Do not continue until you have a verified copy on the Mac.**
@@ -142,7 +142,7 @@ That file is your rollback. Leave it there until you're satisfied.
 From the Mac, in the project directory:
 
 ```bash
-scp wc_server.py wc_healthcheck.py pi@192.168.86.64:<working-directory>/
+scp wc_server.py wc_healthcheck.py pi@192.168.1.50:<working-directory>/
 ```
 
 If the Pi is a git clone of this repo, `git pull` there instead — but check `git status` first, in case the Pi has local edits that never made it back.
@@ -165,12 +165,12 @@ sudo systemctl restart wallconnector
 sudo journalctl -u wallconnector -n 30 --no-pager
 ```
 
-Expect to see `Poller started — 30s interval → 192.168.86.47` and no traceback. You should **not** see any warning about a cloud-synced folder.
+Expect to see `Poller started — 30s interval → 192.168.1.100` and no traceback. You should **not** see any warning about a cloud-synced folder.
 
 Then, from the Mac:
 
 ```bash
-python3 wc_healthcheck.py http://192.168.86.64:8090 --compare ~/Desktop/pi-before.json
+python3 wc_healthcheck.py http://192.168.1.50:8090 --compare ~/Desktop/pi-before.json
 ```
 
 A good result reports `build changed: legacy → templated` as a note, and:
@@ -181,7 +181,7 @@ A good result reports `build changed: legacy → templated` as a note, and:
 
 It exits non-zero and prints `PROBLEM` lines if any session disappeared, the totals dropped, the rates changed, or the poller isn't running. **Treat any `PROBLEM` line as a failed deploy** and roll back.
 
-Finally, open `http://192.168.86.64:8090/` and confirm the session table, both charts and a per-session trend chart all render.
+Finally, open `http://192.168.1.50:8090/` and confirm the session table, both charts and a per-session trend chart all render.
 
 ---
 
@@ -215,10 +215,10 @@ Optional, in the order I'd do them:
 
 ## Checklist
 
-- [ ] SSH access to `pi@192.168.86.64` confirmed working
+- [ ] SSH access to `pi@192.168.1.50` confirmed working
 - [ ] Nothing charging
 - [ ] `pi-before.json` saved on the Mac
-- [ ] Database backup taken on the Pi, integrity `ok`, 91 sessions
+- [ ] Database backup taken on the Pi, integrity `ok`, session count matches
 - [ ] Backup copied to the Mac
 - [ ] Service name, working directory and python path noted
 - [ ] `wc_server.py.legacy` created on the Pi

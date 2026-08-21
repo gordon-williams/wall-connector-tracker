@@ -334,7 +334,7 @@ Writing backups into Dropbox does **not** contradict the warning below about kee
 `wc_backup.py` pulls a running tracker's full history over its REST API into a local SQLite file, for when you want a copy on a different machine without touching the server:
 
 ```bash
-python3 wc_backup.py http://192.168.86.64:8090 --out ~/Desktop/wc-history.db
+python3 wc_backup.py http://192.168.1.50:8090 --out ~/Desktop/wc-history.db
 ```
 
 It needs no access to the server beyond HTTP, verifies the result before replacing any previous copy, and leaves the old one untouched if the source is unreachable. Useful as a manual tool; the cron entry above is what you should rely on.

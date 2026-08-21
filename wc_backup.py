@@ -7,7 +7,7 @@ Reads only over HTTP, so the machine holding the data needs no extra software,
 no SSH access and no code changes — it works against any version of the server.
 Intended to run unattended on a schedule.
 
-    python3 wc_backup.py http://192.168.86.64:8090 --out ~/Backups/wc-history.db
+    python3 wc_backup.py http://192.168.1.50:8090 --out ~/Backups/wc-history.db
 
 Safe to run at any time, including mid-charge:
 
