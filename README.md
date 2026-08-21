@@ -214,30 +214,58 @@ If you'd rather not install anything on your phone, use the offline copy below i
 
 ## Backups
 
-The tracker's database is the only record of your charging history — the charger itself exposes only the *current* session, so anything lost is lost for good. If the server runs on a Raspberry Pi, that history lives on an SD card.
+The tracker's database is the only record of your charging history — the charger itself exposes only the *current* session, so anything lost is lost for good. If the server runs on a Raspberry Pi, that history lives on an SD card, which is the component most likely to fail.
 
-`wc_backup.py` pulls a running tracker's full history over its REST API into a local SQLite file:
+The recommended backup needs **no Python and no scripts to maintain** — two stock tools and one cron line on the machine running the server.
+
+### Why not just upload the database file
+
+In WAL mode recent commits live in the `-wal` sidecar, so copying `wc_sessions.db` on its own can capture a mid-write state or miss data. `sqlite3`'s `.backup` takes a consistent snapshot using SQLite's backup API, safely, even while a car is charging.
+
+### Setup
 
 ```bash
-python3 wc_backup.py http://192.168.86.64:8090 --out ~/Dropbox/Charging/wc-history.db
+sudo apt install -y sqlite3
+curl https://rclone.org/install.sh | sudo bash
 ```
 
-It reads only over HTTP, so the machine holding the data needs no extra software, no SSH access and no code changes — it works against any version of the server, including one you haven't upgraded.
+Configure a Dropbox remote with `rclone config`. On a headless Pi, answer **yes** to "remote or headless machine" — it prints a command to run on a machine with a browser ([`rclone authorize "dropbox"`](https://rclone.org/remote_setup/)), which returns a token you paste back. Name the remote `dropbox`.
 
-Run it on a schedule from any always-on machine on the same network. A `launchd` example is in [launchd.backup.plist.example](launchd.backup.plist.example); on Linux use a cron entry or systemd timer. Every six hours is ample.
+Then one line in `crontab -e`, daily at 3:17am:
 
-### What makes it safe to leave unattended
+```
+17 3 * * * /usr/bin/sqlite3 /path/to/wc_sessions.db ".backup '/tmp/wc-history.db'" && /usr/bin/rclone copy /tmp/wc-history.db dropbox:Charging/pi/ && rm -f /tmp/wc-history.db
+```
 
-- **The existing backup is never damaged.** The new copy is assembled in a `.partial` file and only swapped into place — atomically — once `integrity_check` passes and the session count matches the source.
-- **An unreachable source is not a failure that costs you anything.** If the machine is asleep, off the network, or answering with something that isn't the tracker, the run exits non-zero and leaves the previous backup byte-identical.
-- **A corrupt backup can't become permanent.** If the existing file can't be read, it is renamed to `.unreadable-<timestamp>` and rebuilt from scratch rather than blocking every future run.
-- **Routine runs are nearly free.** Samples for finished sessions are fetched once and reused, so a run with nothing new costs a single HTTP request and about half a second.
+That is the whole thing. Both tools are apt-managed, so a system upgrade updates them rather than breaking them, and there is no interpreter version or virtualenv in the path. Dropbox keeps file version history, so a single filename gives you rollback without accumulating copies.
 
-The backup records where it came from and when, plus the source's rates and vehicles, in a `backup_meta` table.
+Substitute the real database path — find it with `systemctl show wallconnector -p WorkingDirectory`, or read `db_path` from `config.json` if you have set one.
+
+### Restoring
+
+Download the file, stop the server, put it in place, start the server:
+
+```bash
+sudo systemctl stop wallconnector
+cp wc-history.db /path/to/wc_sessions.db
+sudo systemctl start wallconnector
+```
+
+Check it first with `sqlite3 wc-history.db "pragma integrity_check; select count(*) from sessions;"`.
 
 ### Backing up into a synced folder
 
-Writing the backup into Dropbox or iCloud is a good idea, and does **not** contradict the warning below about the live database. The hazard there is a database being actively written by a running server while a sync client copies it mid-write. A backup is written once, verified, closed, and moved into place atomically — there is never a `-wal` file beside it and no process holds it open. Syncing it gives you an offsite copy and file version history for free.
+Writing backups into Dropbox does **not** contradict the warning below about keeping the live database out of one. The hazard there is a database being actively written by a running server while a sync client copies it mid-write. A backup is written once, closed, and uploaded as a complete file — no `-wal` beside it, no process holding it open. Syncing it gives you an offsite copy and version history for free.
+
+### Ad-hoc backups over the network
+
+`wc_backup.py` pulls a running tracker's full history over its REST API into a local SQLite file, for when you want a copy on a different machine without touching the server:
+
+```bash
+python3 wc_backup.py http://192.168.86.64:8090 --out ~/Desktop/wc-history.db
+```
+
+It needs no access to the server beyond HTTP, verifies the result before replacing any previous copy, and leaves the old one untouched if the source is unreachable. Useful as a manual tool; the cron entry above is what you should rely on.
 
 ## Where the database lives
 
