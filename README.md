@@ -225,21 +225,37 @@ In WAL mode recent commits live in the `-wal` sidecar, so copying `wc_sessions.d
 ### Setup
 
 ```bash
-sudo apt install -y sqlite3
-curl https://rclone.org/install.sh | sudo bash
+sudo apt install -y sqlite3 rclone
 ```
 
-Configure a Dropbox remote with `rclone config`. On a headless Pi, answer **yes** to "remote or headless machine" — it prints a command to run on a machine with a browser ([`rclone authorize "dropbox"`](https://rclone.org/remote_setup/)), which returns a token you paste back. Name the remote `dropbox`.
+Configure a Dropbox remote with `rclone config`. On a headless Pi the neatest route needs nothing installed on your laptop — open a tunnelled session first:
 
-Then one line in `crontab -e`, daily at 3:17am:
-
-```
-17 3 * * * /usr/bin/sqlite3 /path/to/wc_sessions.db ".backup '/tmp/wc-history.db'" && /usr/bin/rclone copy /tmp/wc-history.db dropbox:Charging/pi/ && rm -f /tmp/wc-history.db
+```bash
+ssh -L 53682:localhost:53682 pi@<pi-address>
 ```
 
-That is the whole thing. Both tools are apt-managed, so a system upgrade updates them rather than breaking them, and there is no interpreter version or virtualenv in the path. Dropbox keeps file version history, so a single filename gives you rollback without accumulating copies.
+Then run `rclone config` inside it, name the remote `dropbox`, leave client id and secret blank, and answer **yes** to "Use auto config". It prints a `http://127.0.0.1:53682/auth?...` link; open that in your laptop's browser and the tunnel carries it to the Pi. Without the tunnel you would answer "no" and need rclone on a second machine to run [`rclone authorize`](https://rclone.org/remote_setup/).
 
-Substitute the real database path — find it with `systemctl show wallconnector -p WorkingDirectory`, or read `db_path` from `config.json` if you have set one.
+Copy [pi-backup.sh](pi-backup.sh) to the server, make it executable, and add one cron line:
+
+```
+MAILTO=""
+17 3 * * * /home/pi/wallconnector/backup.sh
+```
+
+Edit the paths at the top of the script to match your install.
+
+### Why a script and not a one-line cron entry
+
+The obvious one-liner is `sqlite3 … ".backup /tmp/x.db" && rclone copy /tmp/x.db dropbox:…`, and it is **dangerous**. `sqlite3` creates a new, empty database when handed a path that doesn't exist — so if the database is ever moved, renamed, or lost, the snapshot "succeeds", produces a valid but empty 4 KB file, and rclone faithfully uploads it over your good backup. Every command returns 0, so nothing is logged and nothing looks wrong until you need the backup.
+
+The script exists to check the snapshot before it is allowed to replace anything:
+
+- the source database must exist before we start
+- `integrity_check` must return `ok`
+- the snapshot must contain at least `MIN_SESSIONS` sessions — sessions only accumulate, so a shrinking backup means something is wrong at the source
+
+Any of those failing writes one line to `backup.log` and exits without uploading, leaving the previous backup intact. An empty log means every run has succeeded.
 
 ### Restoring
 
