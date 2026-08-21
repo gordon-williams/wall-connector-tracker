@@ -308,9 +308,22 @@ Open `http://<host>:8099/` and check the history is all there, then stop it and 
 
 > When killing the rehearsal, match the process precisely (`pkill -f 'port 8099'` will also match the shell you typed it in). Stopping it with Ctrl-C is safer.
 
-### What the backup does not cover
+### What gets backed up
 
-Only `wc_sessions.db`. If the whole machine is lost you will also need to reinstate Python and Flask, `wc_server.py`, the systemd unit, the rclone config — and `config.json`, which holds your rates, off-peak window and vehicle definitions. The database is the irreplaceable part; the rest is reconstructible but tedious. Adding `config.json` to the same upload is a sensible extension.
+Two files:
+
+| File | Why |
+|---|---|
+| `wc-history.db` | The history. Irreplaceable — nothing else records it. |
+| `config.json` | Rates, off-peak window, vehicle definitions. Small, and tedious to reconstruct from memory. |
+
+`config.json` is validated as JSON before upload, for the same reason the database is checked: a truncated file must not replace a good copy. A problem with it never stops the database being backed up — it logs a `WARNING` and the run still succeeds, because the database is the part that matters.
+
+Still not covered, and needed only if the machine is lost entirely: Python and Flask, `wc_server.py`, the systemd unit, and the rclone config. All reconstructible from this repository and the setup steps above.
+
+### A note on WAL sidecars
+
+The snapshot inherits WAL mode from the source, so verifying it — which means opening it — creates `-wal` and `-shm` files beside it. The script deletes them on every exit path. A sidecar that reaches the backup location can be swept up by a later restore and applied to a database it does not belong to, which is precisely the corruption the restore steps warn about.
 
 ### Backing up into a synced folder
 

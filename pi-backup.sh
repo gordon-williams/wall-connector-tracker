@@ -10,14 +10,17 @@
 # the snapshot before uploading is what stops a backup system from destroying
 # the thing it is meant to protect.
 #
-# Run from cron. Only failures are written to the log, so an empty log means
-# every run has succeeded. Absolute paths throughout because cron runs with a
-# minimal PATH, and rclone is given an explicit --config because cron does not
-# guarantee HOME.
+# Run from cron. Nothing is written to the log unless something goes wrong, so
+# an empty log means every run succeeded. FAILED means the database was not
+# backed up; WARNING means it was, but config.json was not.
+#
+# Absolute paths throughout because cron runs with a minimal PATH, and rclone is
+# given an explicit --config because cron does not guarantee HOME.
 
 set -u
 
 DB=/home/pi/wallconnector/wc_sessions.db
+CONFIG=/home/pi/wallconnector/config.json
 TMP=/tmp/wc-history.db
 LOG=/home/pi/wallconnector/backup.log
 REMOTE=dropbox:Charging/
@@ -31,11 +34,27 @@ MIN_SESSIONS=50
 
 SQLITE=/usr/bin/sqlite3
 RCLONE=/usr/bin/rclone
+PYTHON=/usr/bin/python3
+
+# The snapshot inherits WAL mode from the source, so verifying it (which means
+# opening it) creates -wal and -shm beside it. They must never linger: a
+# sidecar that reaches the backup location can be picked up by a later restore
+# and applied to a database it does not belong to.
+cleanup() {
+    rm -f "$TMP" "$TMP-wal" "$TMP-shm"
+}
 
 fail() {
     echo "$(date -Is) backup FAILED: $1" >> "$LOG"
-    rm -f "$TMP"
+    cleanup
     exit 1
+}
+
+# config.json is worth having but is not the irreplaceable part. A problem
+# with it must never stop the database from being backed up, so it warns
+# rather than failing the run.
+warn() {
+    echo "$(date -Is) backup WARNING: $1" >> "$LOG"
 }
 
 [ -f "$DB" ] || fail "database missing at $DB"
@@ -43,7 +62,7 @@ fail() {
 [ -x "$RCLONE" ] || fail "rclone not found at $RCLONE"
 [ -f "$RCLONE_CONFIG" ] || fail "rclone config missing at $RCLONE_CONFIG"
 
-rm -f "$TMP"
+cleanup
 
 # Consistent snapshot via SQLite's backup API — safe while the server is
 # writing, and correct in WAL mode where recent commits live in the sidecar.
@@ -65,5 +84,18 @@ esac
 "$RCLONE" --config "$RCLONE_CONFIG" copy "$TMP" "$REMOTE" >/dev/null 2>&1 \
     || fail "rclone upload failed"
 
-rm -f "$TMP"
+cleanup
+
+# ── config.json: rates, off-peak window and vehicle definitions ──────────────
+# Small, static, and tedious to reconstruct from memory after a total loss.
+# Validated before upload for the same reason the database is: a truncated
+# file must not replace a good copy.
+if [ ! -f "$CONFIG" ]; then
+    warn "config.json missing at $CONFIG — database backed up, config was not"
+elif ! "$PYTHON" -m json.tool "$CONFIG" >/dev/null 2>&1; then
+    warn "config.json is not valid JSON — database backed up, config was not"
+elif ! "$RCLONE" --config "$RCLONE_CONFIG" copy "$CONFIG" "$REMOTE" >/dev/null 2>&1; then
+    warn "config.json upload failed — database backed up, config was not"
+fi
+
 exit 0
