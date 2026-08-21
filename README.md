@@ -259,15 +259,58 @@ Any of those failing writes one line to `backup.log` and exits without uploading
 
 ### Restoring
 
-Download the file, stop the server, put it in place, start the server:
+Verified end to end on a live Pi: the Dropbox copy was pulled down, checked, and run as a real server, serving every session correctly.
 
 ```bash
+# 1. Fetch the backup
+rclone copy dropbox:Charging/wc-history.db /tmp/
+
+# 2. Verify it BEFORE trusting it — never restore a file you haven't checked
+sqlite3 /tmp/wc-history.db "pragma integrity_check; select count(*) from sessions;"
+
+# 3. Stop the server so nothing is writing
 sudo systemctl stop wallconnector
-cp wc-history.db /path/to/wc_sessions.db
+
+# 4. Keep the current database rather than deleting it
+mv /home/pi/wallconnector/wc_sessions.db /home/pi/wallconnector/wc_sessions.db.old
+
+# 5. Remove the WAL sidecars — they belong to the OLD database
+rm -f /home/pi/wallconnector/wc_sessions.db-wal /home/pi/wallconnector/wc_sessions.db-shm
+
+# 6. Put the backup in place, owned by the service user
+cp /tmp/wc-history.db /home/pi/wallconnector/wc_sessions.db
+chown pi:pi /home/pi/wallconnector/wc_sessions.db
+
+# 7. Start it
 sudo systemctl start wallconnector
+
+# 8. Confirm
+curl -s localhost:8090/api/summary
 ```
 
-Check it first with `sqlite3 wc-history.db "pragma integrity_check; select count(*) from sessions;"`.
+Step 5 matters. `-wal` and `-shm` describe the database they were created beside; leaving them next to a different file invites SQLite to reconcile two things that never belonged together. The backup is a complete database in its own right and needs no sidecar.
+
+Step 4 matters too — whatever is wrong with the current database, it holds every session since the last backup. Keep it until the restore is proven.
+
+### Rehearsing a restore without disturbing anything
+
+Because the server derives its database path from its own location, a full rehearsal is just a scratch directory and a spare port:
+
+```bash
+mkdir /tmp/restore-test && cd /tmp/restore-test
+rclone copy dropbox:Charging/wc-history.db .
+mv wc-history.db wc_sessions.db
+cp /home/pi/wallconnector/wc_server.py /home/pi/wallconnector/config.json .
+/home/pi/wallconnector/venv/bin/python wc_server.py --port 8099
+```
+
+Open `http://<host>:8099/` and check the history is all there, then stop it and delete the directory. Production is never touched. Worth doing once a year — an untested backup is a guess.
+
+> When killing the rehearsal, match the process precisely (`pkill -f 'port 8099'` will also match the shell you typed it in). Stopping it with Ctrl-C is safer.
+
+### What the backup does not cover
+
+Only `wc_sessions.db`. If the whole machine is lost you will also need to reinstate Python and Flask, `wc_server.py`, the systemd unit, the rclone config — and `config.json`, which holds your rates, off-peak window and vehicle definitions. The database is the irreplaceable part; the rest is reconstructible but tedious. Adding `config.json` to the same upload is a sensible extension.
 
 ### Backing up into a synced folder
 
