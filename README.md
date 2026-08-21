@@ -4,6 +4,8 @@ Session logger and web dashboard for the **Tesla Gen 3 Wall Connector**. Polls t
 
 Runs on a **Raspberry Pi** (systemd) or any always-on machine (macOS launchd). Tested on Python 3.9+.
 
+The history can also be mirrored to a password-protected server on the internet, so you can read it from anywhere without opening a single port at home — see [Remote access](#remote-access-private-internet-mirror).
+
 ## Features
 
 ### Session tracking
@@ -22,6 +24,13 @@ Runs on a **Raspberry Pi** (systemd) or any always-on machine (macOS launchd). T
 - **CSV export** — download the filtered session table as a spreadsheet
 - **Copy chart to clipboard** — saves trend chart or histogram as a high-resolution PNG (3× pixel ratio)
 
+### Reading it away from home
+Three options, in increasing order of machinery:
+
+- **Private network (recommended)** — put the server's machine on a [Tailscale](https://tailscale.com) tailnet and reach the real dashboard from anywhere. Live data, full editing, nothing copied or exported, no ports opened.
+- **Offline copy** — a single self-contained HTML file, whole history baked in, written to a synced folder whenever a session finishes. No server and no account, but a snapshot rather than the live thing.
+- **Private mirror** — the same program in `cloud` mode on an internet host. The server pushes over HTTPS; the mirror serves the identical dashboard behind a password. Use when you need a URL you can share.
+
 ### Multi-vehicle support
 Any number of vehicles, each with a configurable name, maximum charge power, battery capacity, and flag for the off-peak EV rate. The server picks the closest match by power level.
 
@@ -38,6 +47,8 @@ Vehicles can be added, edited, or removed live from the **Settings page** (`/con
 | `GET /api/summary` | All-time totals grouped by vehicle |
 | `GET /api/lifetime` | Lifetime counters from the charger |
 | `GET /api/config` | Current server configuration |
+| `POST /api/sync` | *Mirror only* — authenticated ingest from the home server |
+| `GET /healthz` | *Mirror only* — liveness and last sync time |
 
 ### CLI client
 ```bash
@@ -166,6 +177,238 @@ Edit the plist — replace `/path/to/python3` (find with `which python3`) and `/
 launchctl load ~/Library/LaunchAgents/com.yourname.wallconnector.plist
 ```
 
+## Remote access: private network (recommended)
+
+The dashboard already runs on your LAN — the only thing missing away from home is a route to it. A mesh VPN gives you that without exporting data, opening a router port, or running anything extra.
+
+[Tailscale](https://tailscale.com) is free for personal use, has official ARM packages, and works on a Raspberry Pi.
+
+**Install it on the machine running the server — the Pi — not on your laptop.** The Pi is the machine that has to become reachable; your other devices only need to join the same tailnet. SSH to the Pi first, then:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+```
+
+```bash
+sudo tailscale up
+```
+
+That prints a URL — open it, sign in, and the Pi joins your tailnet. Confirm with `tailscale status`.
+
+Then install the Tailscale **app** on your phone and, if you want it, your Mac, and sign in with the same account. The dashboard is at `http://<pi-hostname>:8090/` from any signed-in device, exactly as it is at home.
+
+> On macOS the install script does **not** install a command-line tool — it detects the platform, picks `method appstore`, and opens the App Store. The App Store build keeps its binary inside `/Applications/Tailscale.app/`, so `sudo tailscale up` on a Mac returns `command not found`. That's expected: on the Mac you sign in through the app's menu-bar icon, and `tailscale up` is a Linux/Pi step only.
+
+Nothing about the server changes: it already binds `0.0.0.0`, so it is reachable over the tailnet interface with no config, no code changes and no restart.
+
+### Why this is the safest of the three
+
+- **No inbound ports.** Tailscale connects outbound; your router configuration is untouched.
+- **Only your devices can reach it.** The dashboard has no password, which is fine here — the tailnet *is* the authentication. Nothing on the public internet can route to it at all.
+- **No copies of your data.** The offline file and the mirror both duplicate your history somewhere else. This doesn't — there's exactly one database and you're reading it directly.
+- **Everything works.** Live status, editing vehicle tags and notes, the Settings page. The other two options are read-only by design.
+
+> ⚠️ Do **not** enable Tailscale **Funnel** on this machine. Funnel deliberately exposes a service to the public internet, which would put an unauthenticated dashboard online. Plain `tailscale up` does not do this.
+
+If you'd rather not install anything on your phone, use the offline copy below instead.
+
+## Where the database lives
+
+By default `wc_sessions.db` sits next to `wc_server.py`. Point it somewhere else with `db_path` in `config.json`, or `--db`:
+
+```json
+"db_path": "~/Library/Application Support/WallConnector/wc_sessions.db"
+```
+
+**Keep it out of Dropbox, iCloud Drive, OneDrive and Google Drive.** A file-syncing service can upload the database and its `-wal` sidecar at different moments, or copy one mid-write; on restore the two disagree and committed transactions are silently lost. This is a [documented way to corrupt SQLite](https://www.sqlite.org/howtocorrupt.html), and the risk climbs sharply if two copies of the server ever run at once. The server warns at startup if it finds itself in one of these folders.
+
+To move an existing database safely:
+
+```bash
+python3 wc_server.py --migrate-db ~/Library/Application\ Support/WallConnector/wc_sessions.db
+```
+
+That takes a consistent snapshot using SQLite's own backup API (correct even mid-write and in WAL mode), verifies the copy with `integrity_check` and a row-count comparison, and only then points `config.json` at the new location. It refuses to overwrite an existing file and never deletes the original — restart the server, confirm it works, then remove the old one yourself.
+
+## Offline copy in a synced folder
+
+The simplest way to read the history from a phone. The home server writes one **self-contained HTML file** — the same dashboard, with every session, sample and total baked in — into a folder that Dropbox or iCloud already syncs. You open the file on your phone. Nothing is hosted, nothing is exposed, and there is no password to manage beyond the one on your storage account.
+
+```json
+"offline_export": {
+    "enabled": true,
+    "path":    "~/Dropbox/Charging/charge-history.html"
+}
+```
+
+It's regenerated at startup, whenever a charging session ends, and whenever you edit a session's vehicle, notes, SOC or rate. Writing goes to a temporary name and is renamed into place, so the sync client never uploads a half-written page. For the current history — 63 sessions and ~12,900 samples — the file is about 1.6 MB and takes ~85 ms to build.
+
+Generate one by hand at any time:
+
+```bash
+python3 wc_server.py --export-offline ~/Desktop/charge-history.html
+```
+
+### How it works
+
+The dashboard is a static page that talks to `/api/*`. Rather than maintain a second copy of it, the export inlines every API response the page asks for and installs a `fetch` that answers from that data. One template serves the live server, the mirror and the offline file — so any change to the dashboard reaches all three.
+
+Everything works except the things that need a charger or a database: the session table with all its filters, both charts, per-session trend charts, summaries, the theme toggle and CSV export. There's no live status card (there's no charger behind a file) and editing is disabled, exactly as on the mirror.
+
+### Things to know
+
+- **The charts load Chart.js from a CDN**, so viewing needs an internet connection — just not a server of your own.
+- **Check it renders on your phone before relying on it.** iOS previews HTML through WebKit and should run it fine, but tap the file once and confirm rather than assume.
+- **Dropbox cannot host this as a website.** Dropbox [discontinued HTML rendering](https://help.dropbox.com/share/public-folder) in 2016–17, so a shared link offers the file for download rather than rendering it. This is a file you open, not a URL you visit. A shared link would also have no password — anyone holding the link would have the data.
+
+## Remote access: private internet mirror
+
+The Wall Connector's API is LAN-only, so the poller has to stay at home. To read the history from anywhere, the home server **pushes** it to a second copy of this same program running in `cloud` mode on an internet host:
+
+```
+Wall Connector ──LAN──▶  home server  ──HTTPS push──▶   mirror    ──login──▶  your phone
+(unauthenticated)       polls, edits     outbound     (read-only)
+```
+
+Nothing inbound is opened on your home network — the Pi makes an outgoing HTTPS request like any other program on your LAN. The mirror only ever holds a copy: it has no route to the charger and it rejects every write.
+
+| | Home server | Mirror |
+|---|---|---|
+| Session history, charts, summaries, CSV export | ✅ | ✅ |
+| Live status card | ✅ live | last synced snapshot |
+| Edit vehicle / notes / SOC / rate | ✅ | ❌ `403` |
+| Settings page (rates, vehicles) | ✅ | ❌ redirects to the dashboard |
+| Needs the Wall Connector on its LAN | ✅ | ❌ |
+
+Edits stay on the home server and flow outward on the next sync.
+
+### Where to host the mirror
+
+It's a long-running Python process with a SQLite file on disk, so the host has to give you both:
+
+| Host | Notes |
+|---|---|
+| **Small VPS** — Hetzner, DigitalOcean, Vultr, Linode | ~$4–6/month. The systemd unit in section 4a works unchanged. |
+| **Fly.io / Render / Railway** | Container hosts with a persistent volume — mount it at the database path. |
+| **Oracle Cloud free tier** | Free always-on VM, if you can get one. |
+
+**Netlify, Vercel and Cloudflare can't run *this* mirror as written — but the reason is the runtime, not storage.** [Netlify Database](https://www.netlify.com/platform/database/) (serverless Postgres, generally available April 2026) would cover persistence fine. The blocker is that Netlify Functions run JavaScript, TypeScript and Go only, so a Flask app can't be deployed there.
+
+Worth knowing if you're weighing it up: the mirror does no background work at all — it's purely request/response — so it *would* fit the serverless model. Porting it means reimplementing the mirror in TypeScript against Postgres and maintaining a second copy of the dashboard alongside this one. The sync protocol itself is portable either way: the home server just POSTs gzipped JSON with a bearer token, which any function runtime can receive.
+
+If your domain is managed at Netlify, the least-effort path is to keep DNS there and point a `charge.` subdomain at a host that runs Python.
+
+### 1. Set up the mirror
+
+Copy the project to the host, then:
+
+```bash
+cp config.cloud.example.json config.json
+python3 wc_server.py --gen-token       # shared secret — copy it
+python3 wc_server.py --hash-password   # prompts, prints a password hash
+```
+
+Put both into its `config.json`:
+
+```json
+{
+    "mode": "cloud",
+    "cloud": {
+        "sync_token":    "<the generated token>",
+        "password_hash": "pbkdf2_sha256$240000$…",
+        "require_https": true
+    }
+}
+```
+
+Bind it to localhost and terminate TLS with a reverse proxy:
+
+```bash
+python3 wc_server.py --mode cloud --host 127.0.0.1 --port 8090
+```
+
+Caddy needs three lines and handles certificates itself:
+
+```
+charge.example.com {
+    reverse_proxy 127.0.0.1:8090
+}
+```
+
+To run it under a production WSGI server instead of Flask's built-in one:
+
+```bash
+pip install gunicorn
+WC_MODE=cloud gunicorn -w 1 --threads 8 -b 127.0.0.1:8090 'wc_server:create_app()'
+```
+
+Use a **single worker** — the SQLite database isn't shared between processes. `create_app()` reads `WC_MODE`, `WC_CONFIG` and `WC_DB` from the environment.
+
+> `require_https` marks the login cookie `Secure`. Leave it `true` in production; set it to `false` only when testing over plain HTTP, or the browser will drop the cookie and you won't be able to log in.
+
+### 2. Point the home server at it
+
+Add a `sync` block to the home `config.json`, using the **same token**:
+
+```json
+"sync": {
+    "enabled":      true,
+    "url":          "https://charge.example.com",
+    "token":        "<the same token>",
+    "interval_s":   300,
+    "sample_batch": 5000
+}
+```
+
+Restart the home server. The first pass backfills the whole history in batches; after that each cycle sends only what changed:
+
+```
+Sync → https://charge.example.com every 300s
+[sync] 63 session(s), 5000 sample(s) → mirror
+[sync] backfill 5000 sample(s)
+[sync] backfill 2893 sample(s)
+```
+
+Open `https://charge.example.com`, log in, and the history is there.
+
+### What gets synced
+
+| Data | When |
+|---|---|
+| Session rows | whenever any row changes — a session finishes, or an old one is edited |
+| 30-second samples | with their session, once it finishes |
+| Rates and vehicles | with any push, so the mirror renders costs and colours identically |
+| Live status snapshot | only when `completed_only` is `false` |
+
+By default (`"completed_only": true`) the mirror is a **history archive**: nothing is sent while a car is charging, and the whole session — row plus every sample — goes out in one push when it ends. That's one network round-trip per session instead of one every polling cycle, which matters a great deal on a metered host. The trade is that the mirror has no live view; you read live status on the LAN dashboard, where the charger actually is.
+
+Set `"completed_only": false` for a near-live mirror that also carries the status card.
+
+Two other knobs keep idle time genuinely idle:
+
+- **Nothing changed, nothing sent.** The sync thread compares a fingerprint of the sessions table and a sample watermark; if neither moved it skips the request entirely rather than sending an empty one. `idle_heartbeat_s` (default 24 h, `0` to disable) forces an occasional push anyway so the mirror can show it's still being fed.
+- **The dashboard stops polling when its tab is hidden**, and refreshes on the way back. A forgotten background tab used to poll all night.
+
+Samples are the bulk of the data and payloads are gzipped, so a typical session push is a few kilobytes. The mirror's header shows when it last heard from home — green under 15 minutes, amber under an hour, red beyond that.
+
+### If the mirror loses its data
+
+Rebuild the host and start it with an empty database. The next time the home server pushes, it compares the row count the mirror reports against what it sent, spots the shortfall, and re-pushes everything.
+
+Note the timing: because idle cycles skip the network entirely, "the next time it pushes" means the next finished session, the next edit, or the `idle_heartbeat_s` heartbeat — whichever comes first, so within a day by default. Lower `idle_heartbeat_s` if you want a lost mirror noticed sooner, at the cost of waking its database more often. To repair it immediately:
+
+```bash
+python3 wc_server.py --resync
+```
+
+### Security notes
+
+- The home server keeps **no inbound ports open** — sync is an outbound HTTPS POST
+- The mirror is behind a password (PBKDF2-SHA256, 240k iterations); the cookie is `HttpOnly`, `SameSite=Lax` and `Secure`. Five bad guesses lock that IP out for a minute
+- `/api/sync` authenticates with a bearer token compared in constant time, and is the only route that bypasses the login
+- The mirror never learns your charger's LAN address — `wc_ip` is not in the payload and not served by the mirror's `/api/config`
+- The token and password hash live in the mirror's `config.json`, which is gitignored
+
 ## How session merging works
 
 The Tesla Wall Connector's `session_energy_wh` counter is cumulative and does **not** reset during scheduled charging pauses (e.g. off-peak delay). When the poller sees charging resume within 2 hours and the counter reading is ≥ 90% of the previous session total, it re-opens the previous session record rather than creating a new one. The result is a single session row covering the entire plug event, with a continuous power-vs-time trend.
@@ -182,6 +425,9 @@ After 2 minutes of charge data the server computes an average power and picks th
 - `config.json` and `wc_sessions.db` are gitignored; they contain personal data
 - The charger only exposes the *current* session; all historical data is accumulated by this server's continuous polling — don't stop the server between charges
 - The Wall Connector API (`/api/1/vitals`) is undocumented and may change in future firmware
+- The mirror is a copy, not a backup of last resort — it holds no data the home server doesn't, and it can't repopulate the home server
+- Running two copies of the server against the same charger is harmless to the charger (its API is read-only) but produces two databases that silently diverge — each only records sessions that happened while it was running
+- The offline HTML file is a snapshot, not a backup — it holds no data the database doesn't, and can't be loaded back in
 - **SD card wear (Raspberry Pi):** the server only writes to SQLite while a charging session is active (~2 writes per 30 s). Idle periods produce no writes at all, so total write volume is low. The database is opened in WAL mode (`PRAGMA journal_mode=WAL`) for efficient sequential writes; a standard SD card will last for years under this workload
 
 ## License
